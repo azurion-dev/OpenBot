@@ -1,0 +1,1371 @@
+const { Client, GatewayIntentBits, Partials, REST, Routes, PermissionsBitField, ChannelType, AuditLogEvent } = require('discord.js');
+const { coerce, infer } = require('./storage');
+const net = require('net'), dns = require('dns'), http = require('http'), https = require('https');
+
+// ---------- safe outgoing HTTP (used by the "API request" block) ----------
+// Blocks private / loopback / link-local / cloud-metadata addresses. The check is done on the IP that is REALLY connected to
+// (so DNS tricks and DNS rebinding do not work) and again on every redirect.
+try { dns.setDefaultResultOrder('ipv4first'); } catch {}   // many cloud hosts have broken IPv6: this avoids EAI_AGAIN / handshake timeouts
+const BAD = new net.BlockList();
+for (const [a, p] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4]]) BAD.addSubnet(a, p, 'ipv4');
+for (const [a, p] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8], ['64:ff9b::', 96], ['2001:db8::', 32]]) BAD.addSubnet(a, p, 'ipv6');
+const isBadIp = ip => {
+  const v = net.isIP(ip); if (!v) return true;
+  if (v === 6) {
+    const low = ip.toLowerCase(), m4 = low.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/), mh = low.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (m4) return isBadIp(m4[1]);
+    if (mh) { const a = parseInt(mh[1], 16), b = parseInt(mh[2], 16); return isBadIp(`${a >> 8}.${a & 255}.${b >> 8}.${b & 255}`); }
+  }
+  return BAD.check(ip, v === 6 ? 'ipv6' : 'ipv4');
+};
+const NOT_ALLOWED = 'This URL is not allowed';
+const safeLookup = (host, opts, cb) => {
+  if (typeof opts === 'function') { cb = opts; opts = {}; }
+  dns.lookup(host, { ...opts, all: true }, (e, addrs) => {
+    if (e) return cb(e);
+    if (!addrs.length || addrs.some(a => isBadIp(a.address))) return cb(new Error(NOT_ALLOWED));
+    if (opts && opts.all) cb(null, addrs); else cb(null, addrs[0].address, addrs[0].family);
+  });
+};
+const MAX_BODY = 1024 * 1024;
+const safeHttp = (u, method, headers, body, hops = 0) => new Promise((resolve, reject) => {
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (!/^https?:$/.test(u.protocol) || u.username || u.password) return reject(new Error(NOT_ALLOWED));
+  if (net.isIP(host) ? isBadIp(host) : /(^|\.)(localhost|local|internal|localdomain)\.?$/i.test(host)) return reject(new Error(NOT_ALLOWED));
+  const req = (u.protocol === 'https:' ? https : http).request(u, { method, headers: { 'user-agent': 'OpenBot', ...headers }, lookup: safeLookup, signal: AbortSignal.timeout(10000) }, res => {
+    if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+      res.resume();
+      if (hops >= 3) return reject(new Error('Too many redirects'));
+      let next; try { next = new URL(res.headers.location, u); } catch { return reject(new Error('Invalid redirect')); }
+      const keep = res.statusCode === 307 || res.statusCode === 308, h = { ...headers };
+      if (next.origin !== u.origin) for (const k of Object.keys(h)) if (/^(authorization|cookie|proxy-authorization)$/i.test(k)) delete h[k];   // never hand credentials to another site
+      return resolve(safeHttp(next, keep ? method : 'GET', h, keep ? body : undefined, hops + 1));
+    }
+    const chunks = []; let n = 0;
+    res.on('data', c => { n += c.length; if (n > MAX_BODY) req.destroy(new Error('Response too large (max 1 MB)')); else chunks.push(c); });
+    res.on('end', () => resolve({ status: res.statusCode, ok: res.statusCode >= 200 && res.statusCode < 300, text: Buffer.concat(chunks).toString('utf8') }));
+    res.on('error', reject);
+  });
+  req.on('error', e => reject(e.name === 'TimeoutError' || e.name === 'AbortError' ? new Error('The request took too long') : e));
+  req.end(body);
+});
+const clients = new Map();
+let saver = () => {};                       // set by server.js so warnings persist
+const setSaver = f => { saver = f; };
+const idsOf = s => String(s || '').match(/\d{15,}/g) || [];
+const findCmd = (db, id) => db.commands.find(x => x.id === id) || (db.events || []).find(x => x.id === id);
+const T = { string: 3, integer: 4, boolean: 5, user: 6, channel: 7, role: 8, mentionable: 9, number: 10, attachment: 11 };
+const ST = { primary: 1, secondary: 2, success: 3, danger: 4, link: 5 };
+const ACT = { online: 'online', idle: 'idle', dnd: 'dnd', invisible: 'invisible' };
+
+const permFlags = s => String(s || '').split(/[\s,]+/).filter(p => PermissionsBitField.Flags[p] !== undefined);
+// shown/hidden by Discord itself only when it is a plain "needs all of these permissions" rule (the real check is gate() below)
+const slashPerms = c => { const p = permFlags(c.reqPerms); return p.length && c.permMode !== 'any' && !idsOf(c.reqRoles).length ? String(PermissionsBitField.resolve(p)) : null; };
+
+// ---------- slash command registration ----------
+const clip = (s, n) => String(s ?? '').trim().slice(0, n);
+const optName = s => String(s || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32);
+
+const toSlash = c => {
+  const seen = new Set();
+  const options = (c.options || []).map(o => ({
+    type: T[o.type] || 3, name: optName(o.name),
+    description: clip(o.description, 100) || 'Option', required: !!o.required
+  })).filter(o => o.name && !seen.has(o.name) && seen.add(o.name))
+     .sort((a, b) => b.required - a.required).slice(0, 25);
+  return {
+    name: c.name, description: clip(c.description, 100) || 'No description', type: 1,
+    dm_permission: !c.guildOnly,
+    default_member_permissions: c.adminOnly ? '8' : slashPerms(c),
+    options
+  };
+};
+
+function modSlash(db) {
+  // Built-in moderation slash commands (stub for now – full handlers can be added later)
+  // Returns empty array so the bot can start without errors.
+  // When you implement the moderation module handlers, expand this.
+  return [];
+}
+
+// Nothing that talks to Discord may ever block a dashboard request: every call has a time limit.
+const withTimeout = (p, ms, msg) => { let t; return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(msg)), ms); })]).finally(() => clearTimeout(t)); };
+const syncState = new Map();                // bot id -> { hash, error, busy, again, force, clearedGlobal }
+const stOf = id => { let s = syncState.get(id); if (!s) syncState.set(id, s = { hash: '', error: '', busy: false, again: false, force: false, clearedGlobal: false }); return s; };
+
+// turns a Discord API error into readable text (includes the invalid field)
+function discordErr(e) {
+  const raw = e?.rawError;
+  let det = '';
+  if (raw?.errors) {
+    const walk = (o, p = '') => Object.entries(o).flatMap(([k, v]) =>
+      v?._errors ? v._errors.map(x => `${p}${k}: ${x.message}`) : (v && typeof v === 'object' ? walk(v, `${p}${k}.`) : []));
+    det = walk(raw.errors).join(' | ');
+  }
+  const code = e?.code ? ` (código ${e.code})` : '';
+  let msg = (e?.message || String(e)) + code + (det ? ' → ' + det : '');
+  if (e?.code === 50001) msg += ' → O bot não tem acesso ao servidor: convide-o de novo com os escopos "bot" e "applications.commands".';
+  if (e?.code === 10004) msg += ' → Servidor (Guild ID) não encontrado.';
+  return msg;
+}
+
+async function sync(client, db, force = false) {
+  const s = db.settings, st = stOf(db.id);
+  const guildId = String(s.guildId || '').trim();
+  if (guildId && !/^\d{15,25}$/.test(guildId))
+    throw new Error('Guild ID inválido: use somente os números do ID do servidor (sem espaços, #, <>).');
+
+  const seen = new Set();
+  const body = [...db.commands.filter(c => c.enabled !== false).map(toSlash), ...modSlash(db)]
+    .filter(c => c.name && !seen.has(c.name) && seen.add(c.name)).slice(0, 100);
+
+  const key = JSON.stringify([guildId, body]);
+  if (!force && st.hash === key) return;    // same commands already registered: do not spend Discord's command-registration limit
+
+  const rest = new REST({ timeout: 15000, rejectOnRateLimit: e => e.timeToReset > 15000 }).setToken(s.token);
+  const appId = client.user.id;
+  const globalRoute = Routes.applicationCommands(appId);
+
+  if (guildId) {
+    if (!client.guilds.cache.has(guildId))
+      throw new Error(`O bot NÃO está no servidor ${guildId}. Convide-o (escopos bot + applications.commands) ou corrija o Guild ID. Servidores onde ele está: ${[...client.guilds.cache.values()].map(g => `${g.name} (${g.id})`).join(', ') || 'nenhum'}.`);
+    await rest.put(Routes.applicationGuildCommands(appId, guildId), { body });
+    console.log(`[sync ${db.name}] ${body.length} comandos enviados ao servidor ${guildId}`);
+    // avoid duplicated commands: clear the global ones once
+    if (!st.clearedGlobal) { await rest.put(globalRoute, { body: [] }).catch(() => {}); st.clearedGlobal = true; }
+    if (s.lastGuild !== guildId) { s.lastGuild = guildId; saver(); }
+  } else {
+    // back to global: clear the commands of the server used before
+    if (s.lastGuild) {
+      await rest.put(Routes.applicationGuildCommands(appId, s.lastGuild), { body: [] }).catch(() => {});
+      s.lastGuild = ''; saver();
+    }
+    await rest.put(globalRoute, { body });
+    st.clearedGlobal = false;
+    console.log(`[sync ${db.name}] ${body.length} comandos enviados (global)`);
+  }
+  st.hash = key;
+}
+
+function presence(client, s) {
+  const t = s.activityText || '';
+  client.user.setPresence({
+    status: ACT[s.status] || 'online',
+    activities: t ? [{ name: t, state: t, type: Number(s.activityType ?? 4) }] : []
+  });
+}
+
+const optText = (o, sub) => {
+  if (!o) return '';
+  if (o.type === 11) return o.attachment?.url ?? '';
+  const obj = o.user || o.role || o.channel;
+  if (sub === 'id') return obj?.id ?? o.value;
+  if (sub === 'name') return o.user?.username ?? o.role?.name ?? o.channel?.name ?? o.value;
+  return o.type === 6 ? `<@${o.value}>` : o.type === 7 ? `<#${o.value}>` : o.type === 8 ? `<@&${o.value}>` : o.type === 9 ? (o.role ? `<@&${o.value}>` : `<@${o.value}>`) : o.value;
+};
+const getVar = (i, path) => { let v = i.vars; for (const p of path) { if (v == null || (typeof v !== 'object' && typeof v !== 'string') || !Object.hasOwn(v, p)) return ''; v = v[p]; } return v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : v; };
+
+// who started the interaction that produced the message a button / dropdown sits on (ticket owner, command runner...)
+const starterOf = i => { const m = i.message; return m?.interactionMetadata?.user || m?.interaction?.user || null; };
+const fill = (t, i) => String(t ?? '').replace(/\{([\w.-]+)\}/g, (m, k) => {
+  const u = i.user, g = i.guild;
+  const s = /^starter/.test(k) ? starterOf(i) : null;
+  const map = {
+    // the person who pressed the button / used the dropdown / submitted the form / ran the command
+    clicker: `<@${u.id}>`, 'clicker.name': u.username, 'clicker.id': u.id, 'clicker.tag': u.tag,
+    'clicker.avatar': u.displayAvatarURL({ size: 256 }), 'clicker.nickname': i.member?.displayName ?? u.username,
+    // the person who ran the command / pressed the button that created the message being clicked now
+    starter: s ? `<@${s.id}>` : '', 'starter.name': s?.username ?? '', 'starter.id': s?.id ?? '', 'starter.tag': s?.tag ?? '',
+    'starter.avatar': s ? s.displayAvatarURL({ size: 256 }) : '',
+    user: `<@${u.id}>`, 'user.name': u.username, 'user.id': u.id,
+    server: g?.name ?? 'DM', 'server.id': g?.id ?? '', 'server.members': g?.memberCount ?? '',
+    channel: `<#${i.channelId}>`, 'user.tag': u.tag, 'user.avatar': u.displayAvatarURL({ size: 256 }),
+    'user.created': `<t:${Math.floor(u.createdTimestamp / 1000)}:R>`, 'server.icon': g?.iconURL() ?? '',
+    'bot.name': i.client.user.username, pressed: i.pressed?.label ?? '', 'pressed.id': i.pressed?.id ?? '', date: new Date().toLocaleDateString('en-US'),
+    time: new Date().toLocaleTimeString('en-US'), random: Math.floor(Math.random() * 100) + 1,
+    'loop.index': i.loop?.index ?? '', 'loop.item': i.loop?.item ?? '', 'loop.count': i.loop?.count ?? '',
+    ...(i.evMap || {})                      // event variables: {message.content}, {member.count}, ...
+  };
+  if (k in map) return map[k];
+  if (k.startsWith('var.')) return getVar(i, k.slice(4).split('.'));
+  if (k === 'selected') return i.selectedText ?? '';
+  if (k.startsWith('field.') && i.fields) { const f = i.fields.fields?.get(k.slice(6)); return f?.values ? f.values.map(v => f.type === 5 || f.type === 7 ? `<@${v}>` : f.type === 6 ? `<@&${v}>` : f.type === 8 ? `<#${v}>` : v).join(', ') : (f?.value ?? ''); }
+  if (k.startsWith('opt.')) {
+    const [name, sub] = k.slice(4).split('.');
+    return optText(i.options?.get(name.toLowerCase()), sub);
+  }
+  // shortcut: {name} resolves to a command option or a saved variable with that name
+  const [base, ...rest] = k.split('.');
+  const o = i.options?.get(base.toLowerCase());
+  if (o) return optText(o, rest[0]);
+  if (i.vars && Object.hasOwn(i.vars, base)) return getVar(i, [base, ...rest]);
+  return m;
+});
+
+const color = c => parseInt(String(c || '#f5a623').replace('#', ''), 16) || 0xf5a623;
+
+const row = (d, cmdId, blockId, max) => {
+  const cs = [];
+  for (let n = 1; n <= max; n++) {
+    const l = d[`b${n}l`]; if (!l) continue;
+    const s = d[`b${n}s`] || 'primary', v = d[`b${n}v`] || '';
+    cs.push(s === 'link'
+      ? { type: 2, style: 5, label: l, url: v }
+      : { type: 2, style: ST[s] || 1, label: l, custom_id: `b:${cmdId}:${blockId}:${n}` });
+  }
+  return cs.length ? { type: 1, components: cs } : null;
+};
+
+async function send(i, o) {
+  if (i.ev) return sendNew(i, o);           // events have no interaction: post in the event channel
+  const { ephemeral, v2, ...body } = o;
+  let flags = (v2 ? 32768 : 0);
+  if (i.deferred && !i.replied) { if (flags) body.flags = flags; return i.editReply(body); }
+  if (ephemeral) flags |= 64;
+  if (flags) body.flags = flags;
+  return i.replied ? i.followUp(body) : i.reply(body);
+}
+
+// Brand-new message in the channel (not an interaction reply; ephemeral does not exist here)
+async function sendNew(i, { ephemeral, v2, ...body }) {
+  if (v2) body.flags = 32768;
+  const ch = i.target ?? i.channel ?? await i.client.channels.fetch(i.channelId).catch(() => null);
+  if (!ch?.send) throw new Error(i.ev ? 'No channel to send to. Set a channel in the event settings.' : 'Could not send a new message here (the bot has no access to this channel). Use "Reply" mode instead.');
+  return ch.send(body);
+}
+
+const optVal = (i, name) => { if (!name) return null; const m = fill(name, i).match(/\d{15,}/); return m ? m[0] : (i.options?.get(name)?.value || null); };
+const idOf = (i, s) => (fill(s, i).match(/\d{15,}/) || [])[0];
+const CT = { text: 0, voice: 2, category: 4, announcement: 5, stage: 13, forum: 15 };
+const saveVar = (i, name, v) => { const n = String(name || '').trim(); if (n && !['__proto__', 'constructor', 'prototype'].includes(n)) (i.vars ||= {})[n] = v; };
+const member = async (i, name) => i.guild.members.fetch(optVal(i, name) || i.user.id);
+const selOpts = d => String(d.options || '').split('\n').filter(l => l.trim()).slice(0, 25).map(l => {
+  const [label, desc, resp] = l.split('|'); return { label: label.trim().slice(0, 100), desc: desc?.trim().slice(0, 100), resp: resp?.trim() };
+});
+const trigFor = (c, ids) => { for (const id of ids) { const n = (c.nodes || []).find(x => x.type === 'on_click' && x.data?.target === id); if (n) return n; } return null; };
+const INTN = { members: 'Server Members', presence: 'Presence', message: 'Message Content' };
+const needInt = (i, k) => { if (!i.client.db.settings.intents?.[k]) throw new Error(`Enable the "${INTN[k]}" intent in Settings to use this block`); };
+const needGuild = i => { if (!i.guild) throw new Error('This block only works in servers'); };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// channel from a field (ID / mention / variable); empty = the channel of the command or event
+const chanOf = async (i, s) => {
+  const id = idOf(i, s) || i.channelId;
+  const ch = id ? await i.client.channels.fetch(id).catch(() => null) : (i.target ?? i.channel ?? null);
+  if (!ch) throw new Error('Channel not found. Set a channel ID, option or variable.');
+  return ch;
+};
+// message from the "channel" + "message" fields; empty message = the message of the event
+const msgOf = async (i, d) => {
+  const ch = await chanOf(i, d.channel), id = idOf(i, d.message) || i.message?.id;
+  if (!id) throw new Error('Set a message ID (or a variable that holds one)');
+  if (!ch.messages) throw new Error('That channel has no messages');
+  const m = await ch.messages.fetch(id).catch(() => null);
+  if (!m) throw new Error('Message not found');
+  return m;
+};
+const threadOf = async (i, s) => {
+  const id = idOf(i, s) || (i.channel?.isThread?.() ? i.channelId : null);
+  const t = id ? await i.client.channels.fetch(id).catch(() => null) : null;
+  if (!t?.isThread?.()) throw new Error('Thread not found. Set a thread ID or variable.');
+  return t;
+};
+const unix = ms => ms ? `<t:${Math.floor(ms / 1000)}:R>` : '';
+const AUTO = { '1 hour': 60, '1 day': 1440, '3 days': 4320, '7 days': 10080 };
+const flag = name => { const p = PermissionsBitField.Flags[name]; if (p === undefined) throw new Error('Unknown permission: ' + name); return p; };
+const okUrl = s => {
+  let u; try { u = new URL(s); } catch { throw new Error('Invalid URL'); }
+  if (!/^https?:$/.test(u.protocol) || /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.|\[?::1)/i.test(u.hostname)) throw new Error('This URL is not allowed');
+  return u.href;
+};
+const emojiKey = (r, s) => !s || r.emoji.toString() === s || r.emoji.name === s || r.emoji.id === s;
+const loopItems = (i, d) => {
+  if (d.mode === 'each line') return fill(d.items, i).split(/\r?\n/).map(x => x.trim()).filter(Boolean).slice(0, 100);
+  const n = Math.min(Math.max(parseInt(fill(d.times, i)) || 1, 1), 100);
+  return Array.from({ length: n }, (_, k) => String(k + 1));
+};
+
+const num = c => parseInt(String(c || '').replace('#', ''), 16) || 0x5865f2;
+const findItem = (o, id) => { if (!o || typeof o !== 'object') return null; if (o.id === id) return o; for (const v of Object.values(o)) { const r = findItem(v, id); if (r) return r; } return null; };
+const SELT = { string: 3, user: 5, role: 6, mentionable: 7, channel: 8 };
+// Emoji input -> Discord emoji object. Accepts a unicode emoji (🔥) or a custom one (<:name:id> / <a:name:id>).
+// Anything else is ignored so an invalid value never breaks the whole message.
+const EMO = /\p{Extended_Pictographic}|\p{Regional_Indicator}|^[0-9#*]️?⃣/u;
+const emo = (s, i) => {
+  s = fill(s, i).trim(); if (!s) return undefined;
+  const m = s.match(/^<(a?):(\w+):(\d+)>$/);
+  if (m) return { id: m[3], name: m[2], animated: !!m[1] };
+  const first = [...new Intl.Segmenter().segment(s)][0]?.segment;
+  return first && EMO.test(first) ? { name: first } : undefined;
+};
+function comp(it, i, cmd, b) {
+  const f = s => fill(s, i), cid = x => `x:${cmd.id}:${b.id}:${x.id}`;
+  const bt = x => {
+    const e = emo(x.emoji, i), l = f(x.label);
+    return x.style === 'link'
+      ? { type: 2, style: 5, label: l || (e ? undefined : 'Link'), emoji: e, url: f(x.value) || 'https://discord.com' }
+      : { type: 2, style: ST[x.style] || 1, label: l || (e ? undefined : 'Button'), emoji: e, custom_id: cid(x) };
+  };
+  switch (it.t) {
+    case 'buttons': return it.buttons?.length ? { type: 1, components: it.buttons.slice(0, 5).map(bt) } : null;
+    case 'select': {
+      const type = SELT[it.kind] || 3, max = Math.max(Number(it.max) || 1, 1);
+      const o = { type, custom_id: cid(it), placeholder: f(it.placeholder) || undefined };
+      if (type === 3) {
+        o.options = (it.options || []).slice(0, 25).map((x, n) => ({ label: f(x.label) || 'Option', description: f(x.desc) || undefined, emoji: emo(x.emoji, i), value: String(n) }));
+        if (!o.options.length) return null;
+        o.max_values = Math.min(max, o.options.length);
+      } else o.max_values = Math.min(max, 25);
+      return { type: 1, components: [o] };
+    }
+    case 'text': return { type: 10, content: f(it.content) || '\u200b' };
+    case 'sep': return { type: 14, divider: it.divider !== false, spacing: Number(it.spacing) || 1 };
+    case 'gallery': {
+      const items = String(it.urls || '').split('\n').filter(u => u.trim()).slice(0, 10).map(u => ({ media: { url: f(u.trim()) } }));
+      return items.length ? { type: 12, items } : null;
+    }
+    case 'section': return { type: 9, components: [{ type: 10, content: f(it.content) || '\u200b' }],
+      accessory: it.acc === 'button' ? bt(it.btn || {}) : { type: 11, media: { url: f(it.thumb) || 'https://cdn.discordapp.com/embed/avatars/0.png' } } };
+    case 'container': return { type: 17, accent_color: it.color ? num(it.color) : undefined, spoiler: !!it.spoiler, components: (it.children || []).map(x => comp(x, i, cmd, b)).filter(Boolean) };
+  }
+  return null;
+}
+function build(i, cmd, b, m = {}) {
+  const f = s => fill(s, i), out = { ephemeral: !!m.ephemeral };
+  if (m.mode === 'v2') { out.v2 = true; out.components = (m.items || []).map(x => comp(x, i, cmd, b)).filter(Boolean); return out; }
+  out.content = f(m.content) || undefined;
+  out.embeds = (m.embeds || []).slice(0, 10).map(e => ({
+    author: e.author?.name ? { name: f(e.author.name), icon_url: f(e.author.icon) || undefined, url: f(e.author.url) || undefined } : undefined,
+    title: f(e.title) || undefined, url: f(e.url) || undefined, description: f(e.description) || undefined, color: num(e.color),
+    fields: (e.fields || []).filter(x => x.name && x.value).slice(0, 25).map(x => ({ name: f(x.name), value: f(x.value), inline: !!x.inline })),
+    image: e.image ? { url: f(e.image) } : undefined, thumbnail: e.thumbnail ? { url: f(e.thumbnail) } : undefined,
+    footer: e.footer?.text ? { text: f(e.footer.text), icon_url: f(e.footer.icon) || undefined } : undefined,
+    timestamp: e.timestamp ? new Date().toISOString() : undefined
+  }));
+  out.components = (m.rows || []).slice(0, 5).map(x => comp(x, i, cmd, b)).filter(Boolean);
+  if (!out.content && !out.embeds.length && !out.components.length) out.content = '\u200b';
+  return out;
+}
+
+async function fail(i, d, n, ok) {
+  if (ok) return;
+  if (n.else) return 'else';
+  if (i.inLoop) return 'skip';              // inside a loop: just go to the next run
+  if (i.ev) return 'stop';                  // events never post "condition not met"
+  await send(i, { content: fill(d.otherwise, i) || '⛔ Condition not met.', ephemeral: true });
+  return 'stop';
+}
+
+// ---------- access control + cooldown ----------
+const cds = new Map();
+// returns 0 when free (and starts the cooldown) or the timestamp (ms) when it ends
+function hitCooldown(i, key, secs, scope) {
+  const who = scope === 'global' ? '*' : scope === 'server' ? (i.guild?.id || 'dm') : i.user.id;
+  const k = `${i.client.db.id}|${key}|${scope}|${who}`, now = Date.now(), until = cds.get(k) || 0;
+  if (until > now) return until;
+  cds.set(k, now + secs * 1000);
+  if (cds.size > 5000) for (const [a, v] of cds) if (v <= now) cds.delete(a);
+  return 0;
+}
+const scopeOf = s => ({ 'each user': 'user', 'each server': 'server', everyone: 'global' }[s] || (['user', 'server', 'global'].includes(s) ? s : 'user'));
+const left = until => `<t:${Math.ceil(until / 1000)}:R>`;
+const pretty = p => p.replace(/([a-z])([A-Z])/g, '$1 $2');
+const roleIdsOf = i => { const r = i.member?.roles; return !r ? [] : Array.isArray(r) ? r : [...r.cache.keys()]; };
+// returns null when the command may run, otherwise the text to show the user
+function gate(i, c) {
+  const need = permFlags(c.reqPerms), allow = idsOf(c.reqRoles), deny = idsOf(c.denyRoles);
+  if (need.length || allow.length || deny.length) {
+    if (!i.guild) return 'This command only works in servers.';
+    const have = roleIdsOf(i), P = i.memberPermissions, any = c.permMode === 'any';
+    const admin = !!P?.has('Administrator') || i.guild.ownerId === i.user.id;
+    let msg = null;
+    if (deny.some(r => have.includes(r))) msg = '⛔ One of your roles is not allowed to use this command.';
+    else {
+      const has = p => !!P?.has(PermissionsBitField.Flags[p]);
+      const checks = [];
+      if (need.length) checks.push(any ? need.some(has) : need.every(has));
+      if (allow.length) checks.push(allow.some(r => have.includes(r)));
+      if (!checks.some(Boolean) && !(admin && c.bypassAdmin !== false)) {
+        const parts = [];
+        if (need.length) parts.push(`${any ? 'one of the permissions' : 'the permission' + (need.length > 1 ? 's' : '')} ${need.map(p => `**${pretty(p)}**`).join(', ')}`);
+        if (allow.length) parts.push(`one of the roles ${allow.map(r => `<@&${r}>`).join(' ')}`);
+        msg = '⛔ You need ' + parts.join(' or ') + ' to use this command.';
+      }
+    }
+    if (msg) return c.denyMsg ? fill(c.denyMsg, i) : msg;
+  }
+  const secs = Math.min(Math.max(Number(c.cooldown) || 0, 0), 604800);
+  if (secs && !(c.cdAdmin && i.memberPermissions?.has('Administrator'))) {
+    const until = hitCooldown(i, 'cmd:' + c.id, secs, scopeOf(c.cooldownScope));
+    if (until) return fill(String(c.cdMsg || '⏳ Slow down! You can use this command again {cooldown}.').replace(/\{cooldown\}/g, left(until)), i);
+  }
+  return null;
+}
+// persistent storage (databases + reaction triggers): written to the bot's folder in ./data by server.js
+let persistT; const persist = () => { clearTimeout(persistT); persistT = setTimeout(() => saver(), 800); };
+const dbn = s => { s = String(s || '').trim().toLowerCase(); return /^[a-z0-9_-]{1,32}$/.test(s) && !['__proto__', 'constructor', 'prototype'].includes(s) ? s : ''; };
+const clone = x => { try { return JSON.parse(JSON.stringify(x ?? {})); } catch { return {}; } };
+
+// ---------- "When Reacted" triggers ----------
+// A message block that sends a message registers every "When Reacted" block pointing at it; the registry survives restarts.
+const fakeOpts = list => { const m = new Map((list || []).map(o => [String(o.name).toLowerCase(), o])); return { data: list || [], get: n => m.get(n) }; };
+async function track(i, c, b, m) {
+  const ns = (c.nodes || []).filter(n => n.type === 'on_react' && n.data?.target === b.id);
+  if (!ns.length) return;
+  if (!(m?.channelId && m.content !== undefined)) m = await i.fetchReply?.().catch(() => null);
+  if (!m?.id) return;
+  const db = i.client.db, reg = (db.reacts ||= {});
+  const rec = (reg[m.id] ||= { at: Date.now(), binds: [] });
+  const opts = (i.options?.data || []).map(o => ({ name: o.name, type: o.type, value: o.value })).filter(o => o.value !== undefined);
+  for (const n of ns) {
+    rec.binds = rec.binds.filter(x => !(x.c === c.id && x.n === n.id));
+    rec.binds.push({ c: c.id, n: n.id, by: i.user?.id, vars: clone(i.vars), opts, ev: clone(i.evMap) });
+    if (n.data.addReaction) for (const e of String(n.data.emoji || '').split(/\s+/).filter(Boolean)) await m.react(e).catch(() => {});
+  }
+  const keys = Object.keys(reg);                               // keep the registry small
+  if (keys.length > 300) for (const k of keys.sort((a, z) => reg[a].at - reg[z].at).slice(0, keys.length - 300)) delete reg[k];
+  persist();
+}
+// Variables of the flow are saved together with every message that has buttons / dropdowns, so ANYONE who presses them later
+// (an admin closing a ticket, for example) sees the same {var.xxx} as the person who ran the flow. Stored in reacts.json (max 300 messages).
+async function remember(i, m, comps) {
+  if (!comps) return;
+  try {
+    if (!(m?.channelId && m.content !== undefined)) m = await i.fetchReply?.().catch(() => null);
+    if (!m?.id) return;
+    const reg = (i.client.db.reacts ||= {}), rec = (reg[m.id] ||= { at: Date.now(), binds: [] });
+    rec.ctx = { vars: clone(i.vars), opts: (i.options?.data || []).map(o => ({ name: o.name, type: o.type, value: o.value })).filter(o => o.value !== undefined), ev: clone(i.evMap) };
+    const keys = Object.keys(reg);
+    if (keys.length > 300) for (const k of keys.sort((a, z) => reg[a].at - reg[z].at).slice(0, keys.length - 300)) delete reg[k];
+    persist();
+  } catch (e) { console.error('Could not save the message variables:', e.message); }
+}
+// context for a button / dropdown press: the snapshot of THAT message wins, then the presser's own last run
+function ctxFor(i, cid) {
+  const rec = i.client.db.reacts?.[i.message?.id]?.ctx;
+  if (rec) return { vars: clone(rec.vars), options: fakeOpts(rec.opts), evMap: clone(rec.ev) };
+  return i.client.ctx?.get(`${i.user.id}:${cid}`) || i.client.ctx?.get(`ev:${cid}`);
+}
+async function reactTrigger(client, r, u) {
+  if (u.bot || u.id === client.user.id) return;
+  const reg = client.db.reacts; if (!reg) return;
+  if (r.partial) r = await r.fetch().catch(() => r);
+  const rec = reg[r.message.id]; if (!rec?.binds?.length) return;
+  const m = r.message.partial ? await r.message.fetch().catch(() => r.message) : r.message;
+  if (u.partial) u = await u.fetch().catch(() => u);
+  const em = [r.emoji.toString(), r.emoji.name, r.emoji.id].filter(Boolean);
+  const member = m.guild ? await m.guild.members.fetch(u.id).catch(() => null) : null;
+  for (const bd of [...rec.binds]) {
+    const cmd = findCmd(client.db, bd.c), node = cmd?.nodes?.find(x => x.id === bd.n && x.type === 'on_react');
+    if (!node) continue;
+    const d = node.data || {}, want = String(d.emoji || '').split(/\s+/).filter(Boolean);
+    if (want.length && !want.some(e => em.includes(e))) continue;
+    if (d.who === 'only who ran the command' && bd.by !== u.id) continue;
+    if (d.once) { rec.binds = rec.binds.filter(x => x !== bd); persist(); }
+    if (d.removeReaction) await r.users.remove(u.id).catch(() => {});
+    const ch = m.channel;
+    const i = { ev: 'react', client, guild: m.guild || null, user: u, channelId: m.channelId, channel: ch, target: ch, message: m,
+      memberPermissions: member?.permissions, vars: clone(bd.vars), options: fakeOpts(bd.opts),
+      evMap: { ...bd.ev, ...mem(u, member, m.guild), ...msg(m), 'reaction.emoji': r.emoji.toString(), 'reaction.emoji.name': r.emoji.name ?? '', 'reaction.emoji.id': r.emoji.id ?? '', 'reaction.count': r.count ?? '' } };
+    runGraph(i, cmd, node.next).catch(e => console.error(`[reaction "${cmd.name}"]`, e.message));
+  }
+}
+
+// ---------- permission rules (channels) and role permissions ----------
+// A rule = { target: '@everyone' | role/user ID, mention or variable, p: { ViewChannel: 'allow' | 'deny' | 'reset', ... } }
+async function ovTargets(i, rules) {
+  const g = i.guild, by = new Map();
+  for (const r of rules || []) {
+    const raw = fill(r.target, i).trim();
+    const id = !raw || /^@?everyone$/i.test(raw) ? g.id : (raw.match(/\d{15,}/) || [])[0];
+    if (!id) throw new Error('Permission rule: set a role or user (ID, mention or variable) or @everyone');
+    const o = by.get(id) || { id, allow: [], deny: [], reset: [] };
+    for (const [p, v] of Object.entries(r.p || {})) {
+      flag(p);                                     // throws a readable error for an unknown permission name
+      if (v === 'allow') o.allow.push(p); else if (v === 'deny') o.deny.push(p); else if (v === 'reset') o.reset.push(p);
+    }
+    by.set(id, o);
+  }
+  const list = [];
+  for (const o of by.values()) {
+    o.type = o.id === g.id || await g.roles.fetch(o.id).catch(() => null) ? 0 : 1;   // 0 = role, 1 = member
+    o.allow = [...new Set(o.allow)]; o.deny = [...new Set(o.deny)].filter(p => !o.allow.includes(p));
+    list.push(o);
+  }
+  return list;
+}
+const toOverwrite = o => ({ id: o.id, type: o.type, allow: o.allow, deny: o.deny });
+const rolePerms = s => [...new Set(String(s || '').split(/[\s,]+/).filter(p => PermissionsBitField.Flags[p] !== undefined))];
+
+const exec = {
+  async message(i, d, c, b) {
+    (i.client.ctx ||= new Map()).set(i.ev ? `ev:${c.id}` : `${i.user.id}:${c.id}`, { vars: i.vars, options: i.options, evMap: i.evMap });
+    const out = build(i, c, b, d.msg);
+    let m = (i.ev || d.msg?.sendMode === 'new') ? await sendNew(i, out) : await send(i, out);
+    if (d.saveAs) {
+      if (!(m?.channelId && m.content !== undefined)) m = await i.fetchReply?.().catch(() => null);
+      saveVar(i, d.saveAs, m?.id);
+    }
+    await remember(i, m, out.components?.length);
+    if (!(out.ephemeral && !i.ev && d.msg?.sendMode !== 'new')) await track(i, c, b, m);
+  },
+  async reply(i, d) { await send(i, { content: fill(d.content, i) || '\u200b', ephemeral: d.ephemeral }); },
+  async defer(i, d) { if (!i.ev) await i.deferReply({ ephemeral: !!d.ephemeral }); },
+  async cond(i, d, c, n) {
+    const a = fill(d.left, i), v = fill(d.right, i), x = [Number(a), Number(v)];
+    const op = { igual: 'equals', diferente: 'not equals', 'contém': 'contains', maior: 'greater', menor: 'less' }[d.op] || d.op || 'equals';
+    const lo = a.toLowerCase(), ro = v.toLowerCase();
+    const ok = { equals: a === v, 'not equals': a !== v, contains: a.includes(v), 'contains (ignore case)': lo.includes(ro), 'not contains': !a.includes(v), 'starts with': a.startsWith(v), 'ends with': a.endsWith(v), greater: x[0] > x[1], less: x[0] < x[1], 'greater or equal': x[0] >= x[1], 'less or equal': x[0] <= x[1], 'is empty': !a.trim(), 'is not empty': !!a.trim() }[op];
+    return fail(i, d, n, ok);
+  },
+  async cond_admin(i, d, c, n) { return fail(i, d, n, !!i.memberPermissions?.has('Administrator')); },
+  async cond_role(i, d, c, n) {
+    needGuild(i); const m = await member(i, d.target), want = fill(d.role, i).match(/\d{15,}/g) || [];
+    if (!want.length) throw new Error('Set at least one role (ID, option or variable)');
+    const has = r => m.roles.cache.has(r), mode = d.mode || 'any';
+    return fail(i, d, n, /all/.test(mode) ? want.every(has) : /none/.test(mode) ? !want.some(has) : want.some(has));
+  },
+  async set_var(i, d) { saveVar(i, d.name, fill(d.value, i)); },
+  async api(i, d) {
+    let u; try { u = new URL(fill(d.url, i)); } catch { throw new Error('Invalid URL'); }
+    let headers = {}; try { headers = JSON.parse(fill(d.headers, i) || '{}'); } catch { throw new Error('Headers must be valid JSON'); }
+    if (!headers || typeof headers !== 'object' || Array.isArray(headers)) throw new Error('Headers must be a JSON object');
+    const clean = {};
+    for (const [k, v] of Object.entries(headers)) if (/^[\w-]{1,64}$/.test(k) && !/^(host|content-length|transfer-encoding|connection|upgrade)$/i.test(k) && ['string', 'number', 'boolean'].includes(typeof v)) clean[k] = String(v).slice(0, 2000);
+    const method = String(d.method || 'GET').toUpperCase();
+    if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) throw new Error('Method not allowed');
+    const r = await safeHttp(u, method, clean, method === 'GET' ? undefined : fill(d.body, i) || undefined);
+    let data = r.text; try { data = JSON.parse(r.text); } catch {}
+    saveVar(i, d.saveAs || 'api', { status: r.status, ok: r.ok, data });
+  },
+  async channel_create(i, d) {
+    needGuild(i);
+    const kind = CT[d.kind] ?? 0, o = { name: fill(d.name, i) || 'new-channel', type: kind };
+    const parent = idOf(i, d.parent); if (parent) o.parent = parent;
+    if (d.topic && [0, 5, 15].includes(kind)) o.topic = fill(d.topic, i);
+    if (d.nsfw && kind !== 4) o.nsfw = true;
+    const n = k => { const v = fill(d[k], i).trim(); return v === '' || !Number.isFinite(Number(v)) ? undefined : Number(v); };
+    if (n('slowmode') !== undefined && [0, 15].includes(kind)) o.rateLimitPerUser = Math.min(Math.max(n('slowmode'), 0), 21600);
+    if ([2, 13].includes(kind)) {
+      if (n('userLimit') !== undefined) o.userLimit = Math.min(Math.max(n('userLimit'), 0), 99);
+      if (n('bitrate') !== undefined) o.bitrate = Math.max(n('bitrate'), 8) * 1000;
+    }
+    const sync = /sync/i.test(d.permMode || ''), ov = sync ? [] : await ovTargets(i, d.rules);
+    if (ov.length) o.permissionOverwrites = ov.map(toOverwrite);
+    const ch = await i.guild.channels.create({ ...o, reason: fill(d.reason, i) || undefined });
+    if (sync) { if (!parent) throw new Error('Sync needs a category ID'); await ch.lockPermissions(); }
+    saveVar(i, d.saveAs, ch.id);
+  },
+  async channel_edit(i, d) {
+    needGuild(i);
+    const ch = await i.guild.channels.fetch(idOf(i, d.channel) || i.channelId);
+    if (!ch) throw new Error('Channel not found');
+    const reason = fill(d.reason, i) || undefined, e = {};
+    const num = k => { const v = fill(d[k], i).trim(); return v === '' || !Number.isFinite(Number(v)) ? undefined : Number(v); };
+    if (d.name) e.name = fill(d.name, i);
+    if (d.topic) e.topic = fill(d.topic, i);
+    if (num('slowmode') !== undefined) e.rateLimitPerUser = Math.min(Math.max(num('slowmode'), 0), 21600);
+    if (d.nsfw !== undefined) e.nsfw = !!d.nsfw;
+    const pr = fill(d.parent, i).trim();
+    if (pr) {
+      if (/^(none|null|0|nenhuma?)$/i.test(pr)) e.parent = null;
+      else { const pid = idOf(i, pr); if (!pid) throw new Error('Invalid category ID'); e.parent = pid; }
+    }
+    if (num('position') !== undefined) e.position = Math.max(num('position'), 0);
+    if (num('userLimit') !== undefined) e.userLimit = Math.min(Math.max(num('userLimit'), 0), 99);
+    if (num('bitrate') !== undefined) e.bitrate = Math.max(num('bitrate'), 8) * 1000;
+    if (Object.keys(e).length) await ch.edit({ ...e, reason });
+    // ----- permissions -----
+    const mode = d.permMode || '';
+    if (/do not|don.?t|keep/i.test(mode)) return;
+    const rules = await ovTargets(i, d.rules);
+    if (!rules.length && !/sync|replace/i.test(mode)) return;
+    if (!ch.permissionOverwrites) throw new Error('This channel type does not support permissions');
+    if (/sync/i.test(mode)) { if (!ch.parent) throw new Error('The channel is not inside a category'); await ch.lockPermissions(); return; }
+    if (/replace/i.test(mode)) { await ch.permissionOverwrites.set(rules.map(toOverwrite), reason); return; }
+    for (const o of rules) {
+      const patch = {};
+      for (const p of o.reset) patch[p] = null;
+      for (const p of o.deny) patch[p] = false;
+      for (const p of o.allow) patch[p] = true;
+      if (Object.keys(patch).length) await ch.permissionOverwrites.edit(o.id, patch, { type: o.type, reason });
+    }
+  },
+  async channel_delete(i, d) {
+    needGuild(i); const id = idOf(i, d.channel); if (!id) throw new Error('Set a channel ID');
+    await (await i.guild.channels.fetch(id)).delete(fill(d.reason, i) || undefined);
+  },
+  async role_create(i, d) {
+    needGuild(i);
+    const perms = rolePerms(d.perms), r = await i.guild.roles.create({ name: fill(d.name, i) || 'new role', color: d.color ? num(d.color) : undefined, hoist: !!d.hoist, mentionable: !!d.mentionable, ...(perms.length ? { permissions: perms } : {}) });
+    saveVar(i, d.saveAs, r.id);
+  },
+  async role_edit(i, d) {
+    needGuild(i); const r = await i.guild.roles.fetch(idOf(i, d.role)); if (!r) throw new Error('Role not found');
+    const e = {}; if (d.name) e.name = fill(d.name, i); if (d.color) e.color = num(d.color);
+    if (d.hoist !== undefined) e.hoist = !!d.hoist; if (d.mentionable !== undefined) e.mentionable = !!d.mentionable;
+    const list = rolePerms(d.perms), pm = d.permMode || '';
+    if (!/not changed/i.test(pm) && (list.length || /replace/i.test(pm))) {
+      const cur = new PermissionsBitField(r.permissions.bitfield);
+      e.permissions = /replace|only/i.test(pm) ? new PermissionsBitField(list) : /remov/i.test(pm) ? cur.remove(list) : cur.add(list);
+    }
+    await r.edit(e);
+  },
+  async role_delete(i, d) {
+    needGuild(i); const r = await i.guild.roles.fetch(idOf(i, d.role)); if (!r) throw new Error('Role not found');
+    await r.delete(fill(d.reason, i) || undefined);
+  },
+  async nickname(i, d) { needGuild(i); await (await member(i, d.target)).setNickname(fill(d.nick, i) || null); },
+  async unban(i, d) { needGuild(i); const id = idOf(i, d.user); if (!id) throw new Error('Set a user ID'); await i.guild.members.unban(id, fill(d.reason, i) || undefined); },
+  async get_presence(i, d) {
+    needInt(i, 'presence'); needGuild(i);
+    const m = await i.guild.members.fetch({ user: optVal(i, d.target) || i.user.id, withPresences: true });
+    saveVar(i, d.saveAs || 'presence', m.presence?.status || 'offline');
+  },
+  async read_message(i, d) {
+    needInt(i, 'message');
+    const ch = await i.client.channels.fetch(idOf(i, d.channel) || i.channelId);
+    const list = [...(await ch.messages.fetch({ limit: Math.min(Math.max(Number(d.count) || 1, 1), 50) })).values()];
+    saveVar(i, d.saveAs || 'messages', { count: list.length, last: list[0]?.content ?? '', author: list[0]?.author?.id ?? '', text: list.reverse().map(m => `${m.author.username}: ${m.content}`).join('\n') });
+  },
+  async role_members(i, d) {
+    needInt(i, 'members'); needGuild(i);
+    const id = idOf(i, d.role); if (!id) throw new Error('Set a role (ID, option or variable)');
+    const all = await i.guild.members.fetch(), list = [...all.filter(m => m.roles.cache.has(id)).values()];
+    saveVar(i, d.saveAs || 'members', { count: list.length, mentions: list.slice(0, 50).map(m => `<@${m.id}>`).join(' ') });
+  },
+  async wait(i, d) { await new Promise(r => setTimeout(r, Math.min(Number(d.seconds) || 1, 60) * 1000)); },
+  async embed(i, d) {
+    const e = { title: fill(d.title, i) || undefined, description: fill(d.description, i) || undefined, color: color(d.color) };
+    if (d.footer) e.footer = { text: fill(d.footer, i) };
+    if (d.image) e.image = { url: d.image };
+    if (d.thumbnail) e.thumbnail = { url: d.thumbnail };
+    if (d.timestamp) e.timestamp = new Date().toISOString();
+    e.fields = String(d.fields || '').split('\n').filter(l => l.includes('|')).slice(0, 25).map(l => {
+      const [name, value, inline] = l.split('|'); return { name: fill(name, i), value: fill(value, i), inline: inline?.trim() === 'inline' };
+    });
+    await send(i, { embeds: [e], ephemeral: d.ephemeral });
+  },
+  async buttons(i, d, c, b) {
+    const r = row(d, c.id, b.id, 3);
+    await send(i, { content: fill(d.content, i) || undefined, components: r ? [r] : [], ephemeral: d.ephemeral });
+  },
+  async cv2(i, d, c, b) {
+    const txt = { type: 10, content: fill(d.text, i) || '\u200b' };
+    const inner = [d.thumbnail ? { type: 9, components: [txt], accessory: { type: 11, media: { url: d.thumbnail } } } : txt];
+    if (d.image) inner.push({ type: 12, items: [{ media: { url: d.image } }] });
+    const r = row(d, c.id, b.id, 2);
+    if (r) inner.push({ type: 14 }, r);
+    await send(i, { v2: true, components: [{ type: 17, accent_color: color(d.color), components: inner }], ephemeral: d.ephemeral });
+  },
+  async modal(i, d, c, b) {
+    if (i.ev) throw new Error('Modals need a user interaction (command or button), they cannot be shown from an event');
+    const comps = [], m = d.modal;
+    if (m) {
+      const items = (m.items || []).slice(0, 5), hasSel = items.some(x => x.t === 'select');
+      for (const it of items) {
+        const id = it.id || 'field', req = it.required !== false, label = (fill(it.label, i) || 'Field').slice(0, 45);
+        if (it.t === 'select') {
+          const type = SELT[it.kind] || 3, mx = Math.max(Number(it.max) || 1, 1);
+          const comp = { type, custom_id: id, placeholder: fill(it.placeholder, i) || undefined, required: req, min_values: req ? 1 : 0, max_values: mx };
+          if (type === 3) {
+            comp.options = (it.options || []).slice(0, 25).map(o => ({ label: (fill(o.label, i) || 'Option').slice(0, 100), value: String(o.value || o.label || 'x').slice(0, 100), description: o.desc || undefined, emoji: emo(o.emoji, i) }));
+            if (!comp.options.length) continue;
+            comp.max_values = Math.min(mx, comp.options.length);
+          }
+          comps.push({ type: 18, label, component: comp });
+        } else {
+          const inp = { type: 4, custom_id: id, style: it.style === 'paragraph' ? 2 : 1, required: req, placeholder: fill(it.placeholder, i) || undefined, min_length: Number(it.min) || undefined, max_length: Number(it.max) || undefined, value: fill(it.value, i) || undefined };
+          comps.push(hasSel ? { type: 18, label, component: inp } : { type: 1, components: [{ ...inp, label }] });
+        }
+      }
+    } else {
+      for (let n = 1; n <= 4; n++) {
+        const l = d[`m${n}l`]; if (!l) continue;
+        comps.push({ type: 1, components: [{ type: 4, custom_id: d[`m${n}i`] || `field${n}`, label: l.slice(0, 45), style: ['parágrafo', 'paragraph'].includes(d[`m${n}s`]) ? 2 : 1, required: !d[`m${n}o`] }] });
+      }
+    }
+    if (!comps.length) throw new Error('Add at least one field to the modal');
+    (i.client.ctx ||= new Map()).set(`${i.user.id}:${c.id}`, { vars: i.vars, options: i.options });
+    await i.showModal({ custom_id: `m:${c.id}:${b.id}`, title: (fill(m?.title ?? d.title, i) || 'Form').slice(0, 45), components: comps });
+    return 'stop';
+  },
+  async random(i, d) {
+    const o = String(fill(d.options, i)).split('\n').filter(l => l.trim());
+    if (!o.length) throw new Error('Add at least one option');
+    saveVar(i, d.saveAs || 'random', o[Math.floor(Math.random() * o.length)].trim());
+  },
+  async math(i, d) {
+    const e = fill(d.expr, i).replace(/,/g, '.');
+    if (!/^[\d\s+\-*/%().]+$/.test(e)) throw new Error('Invalid math expression');
+    saveVar(i, d.saveAs || 'math', Function(`"use strict";return (${e})`)());
+  },
+  async select(i, d, c, b) {
+    const type = { string: 3, user: 5, role: 6, mentionable: 7, channel: 8 }[d.kind] || 3;
+    const comp = { type, custom_id: `s:${c.id}:${b.id}`, placeholder: d.placeholder || undefined };
+    const max = Math.max(Number(d.max) || 1, 1);
+    if (type === 3) {
+      comp.options = selOpts(d).map((o, n) => ({ label: o.label, description: o.desc || undefined, value: String(n) }));
+      if (!comp.options.length) throw new Error('Add options to the menu');
+      comp.max_values = Math.min(max, comp.options.length);
+    } else comp.max_values = Math.min(max, 25);
+    await send(i, { content: fill(d.content, i) || undefined, components: [{ type: 1, components: [comp] }], ephemeral: d.ephemeral });
+  },
+  async send_channel(i, d, c, b) {
+    const ch = await chanOf(i, d.channel);
+    if (!ch.send) throw new Error('That channel cannot receive messages');
+    let m;
+    if (d.msg) {                                   // full message editor (embeds, buttons, dropdowns, Components V2)
+      (i.client.ctx ||= new Map()).set(i.ev ? `ev:${c.id}` : `${i.user.id}:${c.id}`, { vars: i.vars, options: i.options, evMap: i.evMap });
+      const { ephemeral, v2, ...body } = build(i, c, b, d.msg);
+      if (v2) body.flags = 32768;
+      m = await ch.send(body);
+      await remember(i, m, body.components?.length);
+    } else m = await ch.send({ content: fill(d.content, i) || '\u200b' });   // blocks made before the editor existed
+    saveVar(i, d.saveAs, m.id);
+    await track(i, c, b, m);
+  },
+  async dm(i, d, c, b) {
+    const uidv = optVal(i, d.target), user = uidv ? await i.client.users.fetch(uidv) : i.user;
+    let m;
+    if (d.msg) {                                   // full message editor, same as "Send to Channel"
+      const snap = { vars: i.vars, options: i.options, evMap: i.evMap };
+      (i.client.ctx ||= new Map()).set(`${user.id}:${c.id}`, snap);       // buttons are pressed by the person who got the DM
+      if (i.ev) i.client.ctx.set(`ev:${c.id}`, snap);
+      const { ephemeral, v2, ...body } = build(i, c, b, d.msg);
+      if (v2) body.flags = 32768;
+      m = await user.send(body);
+      await remember(i, m, body.components?.length);
+    } else m = await user.send({ content: fill(d.content, i) || '\u200b' });  // blocks made before the editor existed
+    saveVar(i, d.saveAs, m.id);
+    await track(i, c, b, m);
+  },
+  async role_add(i, d) { needGuild(i); const r = idOf(i, d.role); if (!r) throw new Error('Set a role (ID, option or variable)'); await (await member(i, d.target)).roles.add(r); },
+  async role_remove(i, d) { needGuild(i); const r = idOf(i, d.role); if (!r) throw new Error('Set a role (ID, option or variable)'); await (await member(i, d.target)).roles.remove(r); },
+  async kick(i, d) { needGuild(i); await (await member(i, d.target)).kick(fill(d.reason, i)); },
+  async ban(i, d) { needGuild(i); const id = optVal(i, d.target); if (!id) throw new Error('Set the user option'); await i.guild.members.ban(id, { reason: fill(d.reason, i) }); },
+  async timeout(i, d) { needGuild(i); const mins = Number(fill(d.minutes, i)); const minutes = (Number.isFinite(mins) && mins > 0) ? mins : 1; await (await member(i, d.target)).timeout(minutes * 60000, fill(d.reason, i)); },
+  async purge(i, d) { needGuild(i); await i.channel.bulkDelete(Math.min(Number(d.amount) || 10, 100), true); },
+
+  // ----- flow -----
+  async stop() { return 'stop'; },
+  async loop_break() { return 'break'; },
+
+  // ----- messages -----
+  async message_edit(i, d) {
+    const m = await msgOf(i, d);
+    if (m.author.id !== i.client.user.id) throw new Error('The bot can only edit its own messages');
+    const e = {};
+    if (d.content) e.content = fill(d.content, i);
+    if (d.title || d.description) e.embeds = [{ title: fill(d.title, i) || undefined, description: fill(d.description, i) || undefined, color: num(d.color || '#5865f2') }];
+    if (!Object.keys(e).length) throw new Error('Nothing to change: set a new text or embed');
+    await m.edit(e);
+  },
+  async message_delete(i, d) {
+    const m = await msgOf(i, d), delay = Math.min(Math.max(Number(d.delay) || 0, 0), 300);
+    if (delay) setTimeout(() => m.delete().catch(() => {}), delay * 1000); else await m.delete();
+  },
+  async message_react(i, d) {
+    const m = await msgOf(i, d), e = fill(d.emoji, i).trim();
+    if (!e) throw new Error('Set an emoji');
+    await m.react(e);
+  },
+  async message_unreact(i, d) {
+    const m = await msgOf(i, d), e = fill(d.emoji, i).trim(), u = optVal(i, d.target);
+    if (!e && !u) return void await m.reactions.removeAll();
+    for (const r of [...m.reactions.cache.values()].filter(r => emojiKey(r, e))) {
+      if (u) await r.users.remove(u).catch(() => {}); else await r.remove();
+    }
+  },
+  async message_pin(i, d) { const m = await msgOf(i, d); if (d.action === 'unpin') await m.unpin(); else await m.pin(); },
+  async message_get(i, d) {
+    const m = await msgOf(i, d);
+    saveVar(i, d.saveAs || 'message', { id: m.id, content: m.content, author: m.author.id, authorName: m.author.username, url: m.url, channel: m.channelId,
+      reactions: [...m.reactions.cache.values()].reduce((a, r) => a + r.count, 0), attachments: m.attachments.size, pinned: m.pinned });
+  },
+  async webhook(i, d) {
+    const u = fill(d.url, i).trim();
+    if (!/^https:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\/\d+\/[\w-]+$/.test(u)) throw new Error('Use a valid Discord webhook URL');
+    const r = await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(10000),
+      body: JSON.stringify({ content: fill(d.content, i) || '\u200b', username: fill(d.username, i) || undefined, avatar_url: fill(d.avatar, i) || undefined, allowed_mentions: { parse: [] } }) });
+    if (!r.ok) throw new Error('Webhook failed (' + r.status + ')');
+  },
+
+  // ----- threads -----
+  async thread_create(i, d) {
+    needGuild(i);
+    const ch = await chanOf(i, d.channel), name = (fill(d.name, i) || 'New thread').slice(0, 100), auto = AUTO[d.archive] || 1440, mid = idOf(i, d.message);
+    let t;
+    if (mid) {
+      if (!ch.messages) throw new Error('That channel has no messages to start a thread from');
+      t = await (await ch.messages.fetch(mid)).startThread({ name, autoArchiveDuration: auto });
+    } else if ([ChannelType.GuildForum, ChannelType.GuildMedia].includes(ch.type)) {
+      t = await ch.threads.create({ name, autoArchiveDuration: auto, message: { content: fill(d.starter, i) || '\u200b' } });
+    } else {
+      if (!ch.threads) throw new Error('Threads can only be created in text, announcement or forum channels');
+      t = await ch.threads.create({ name, autoArchiveDuration: auto, type: d.kind === 'private' ? ChannelType.PrivateThread : ChannelType.PublicThread, invitable: d.kind === 'private' ? false : undefined });
+    }
+    const au = optVal(i, d.addUser); if (au) await t.members.add(au).catch(() => {});
+    saveVar(i, d.saveAs, t.id);
+  },
+  async thread_edit(i, d) {
+    const t = await threadOf(i, d.thread), e = {};
+    if (d.name) e.name = fill(d.name, i).slice(0, 100);
+    if (d.archived === 'archive') e.archived = true; else if (d.archived === 'unarchive') e.archived = false;
+    if (d.locked === 'lock') e.locked = true; else if (d.locked === 'unlock') e.locked = false;
+    if (d.slowmode !== undefined && d.slowmode !== '') e.rateLimitPerUser = Math.min(Math.max(Number(d.slowmode) || 0, 0), 21600);
+    if (AUTO[d.archiveAfter]) e.autoArchiveDuration = AUTO[d.archiveAfter];
+    if (!Object.keys(e).length) throw new Error('Nothing to change');
+    if (t.archived && e.archived === undefined) e.archived = false;   // archived threads cannot be edited
+    await t.edit(e);
+  },
+  async thread_delete(i, d) { await (await threadOf(i, d.thread)).delete(fill(d.reason, i) || undefined); },
+  async thread_member(i, d) {
+    const t = await threadOf(i, d.thread), id = optVal(i, d.target) || i.user.id;
+    if (d.action === 'remove') await t.members.remove(id); else await t.members.add(id);
+  },
+
+  // ----- channels / server -----
+  async channel_perms(i, d) {
+    needGuild(i);
+    const ch = await i.guild.channels.fetch(idOf(i, d.channel) || i.channelId);
+    if (!ch?.permissionOverwrites) throw new Error('Channel not found');
+    const perm = d.perm || 'SendMessages'; flag(perm);
+    const tid = idOf(i, d.target) || i.guild.id, isRole = tid === i.guild.id || i.guild.roles.cache.has(tid);
+    const v = { allow: true, deny: false, reset: null }[d.value || 'deny'];
+    await ch.permissionOverwrites.edit(tid, { [perm]: v }, { type: isRole ? 0 : 1, reason: fill(d.reason, i) || undefined });
+  },
+  async invite_create(i, d) {
+    needGuild(i); const ch = await chanOf(i, d.channel);
+    if (!ch.createInvite) throw new Error('Invites can only be created in server channels');
+    const inv = await ch.createInvite({ maxAge: Math.max(Number(d.minutes) || 0, 0) * 60, maxUses: Math.max(Number(d.uses) || 0, 0), unique: true });
+    saveVar(i, d.saveAs || 'invite', { code: inv.code, url: inv.url });
+  },
+  async server_edit(i, d) {
+    needGuild(i); const e = {};
+    if (d.name) e.name = fill(d.name, i).slice(0, 100);
+    if (d.icon) e.icon = okUrl(fill(d.icon, i));
+    if (!Object.keys(e).length) throw new Error('Nothing to change');
+    await i.guild.edit(e);
+  },
+  async emoji_create(i, d) {
+    needGuild(i);
+    const e = await i.guild.emojis.create({ attachment: okUrl(fill(d.url, i)), name: (fill(d.name, i) || 'emoji').replace(/\W/g, '_').slice(0, 32) });
+    saveVar(i, d.saveAs, e.id);
+  },
+  async get_server(i, d) {
+    needGuild(i); const g = i.guild;
+    saveVar(i, d.saveAs || 'server', { id: g.id, name: g.name, members: g.memberCount, channels: g.channels.cache.size, roles: g.roles.cache.size, boosts: g.premiumSubscriptionCount ?? 0,
+      level: g.premiumTier, owner: `<@${g.ownerId}>`, ownerId: g.ownerId, icon: g.iconURL() ?? '', created: unix(g.createdTimestamp) });
+  },
+
+  // ----- members -----
+  async untimeout(i, d) { needGuild(i); await (await member(i, d.target)).timeout(null, fill(d.reason, i) || undefined); },
+  async voice(i, d) {
+    needGuild(i); const m = await member(i, d.target), a = d.action || 'move';
+    if (!m.voice?.channelId) throw new Error('That member is not in a voice channel');
+    if (a === 'move') { const id = idOf(i, d.channel); if (!id) throw new Error('Set the voice channel to move to'); await m.voice.setChannel(id); }
+    else if (a === 'disconnect') await m.voice.disconnect();
+    else if (a === 'mute' || a === 'unmute') await m.voice.setMute(a === 'mute');
+    else await m.voice.setDeaf(a === 'deafen');
+  },
+  async get_member(i, d) {
+    needGuild(i); const m = await member(i, d.target), u = m.user;
+    saveVar(i, d.saveAs || 'member', { id: u.id, name: u.username, tag: u.tag, nickname: m.nickname || u.username, display: m.displayName, bot: u.bot,
+      roles: m.roles.cache.size - 1, mentions: m.roles.cache.filter(r => r.id !== i.guild.id).map(r => `<@&${r.id}>`).join(' '),
+      joined: unix(m.joinedTimestamp), created: unix(u.createdTimestamp), joinedDays: m.joinedTimestamp ? Math.floor((Date.now() - m.joinedTimestamp) / 864e5) : 0,
+      boosting: !!m.premiumSince, timedOut: !!m.isCommunicationDisabled(), avatar: m.displayAvatarURL({ size: 256 }) });
+  },
+
+  // ----- utility -----
+  async text(i, d) {
+    const s = fill(d.input, i), a = fill(d.arg, i), b = fill(d.arg2, i);
+    const r = { uppercase: s.toUpperCase(), lowercase: s.toLowerCase(), capitalize: s.replace(/\b\w/g, c => c.toUpperCase()), trim: s.trim(), length: s.length,
+      replace: a ? s.split(a).join(b) : s, substring: s.slice(Number(a) || 0, b === '' ? undefined : Number(b)),
+      split: s.split(a || ',')[Math.max((Number(b) || 1) - 1, 0)]?.trim() ?? '' }[d.op || 'uppercase'];
+    saveVar(i, d.saveAs || 'text', r);
+  },
+
+  // ----- conditions -----
+  async cond_chance(i, d, c, n) { const p = Number(fill(d.percent, i)); return fail(i, d, n, Math.random() * 100 < (Number.isFinite(p) ? p : 50)); },
+  async cond_perms(i, d, c, n) {
+    needGuild(i); const m = await member(i, d.target);
+    const list = String(d.perms || d.perm || 'Administrator').split(/[\s,]+/).filter(Boolean).map(flag), has = p => m.permissions.has(p);
+    return fail(i, d, n, /any/.test(d.mode || '') ? list.some(has) : list.every(has));
+  },
+  async cond_channel(i, d, c, n) {
+    const ch = await chanOf(i, d.channel), v = fill(d.value, i).trim(), id = (v.match(/\d{15,}/) || [])[0], mode = d.mode || 'is channel';
+    const TY = { text: [0], voice: [2], category: [4], announcement: [5], stage: [13], forum: [15], thread: [10, 11, 12], dm: [1] };
+    const ok = { 'is channel': !!id && ch.id === id, 'is in category': !!id && (ch.parentId === id || ch.parent?.parentId === id),
+      'is type': (TY[v.toLowerCase()] || []).includes(ch.type), 'name contains': !!v && (ch.name || '').toLowerCase().includes(v.toLowerCase()), 'is NSFW': !!ch.nsfw }[mode];
+    return fail(i, d, n, !!ok);
+  },
+  async cond_user(i, d, c, n) {
+    const mode = d.mode || 'is one of these users', v = fill(d.value, i).trim(), ids = v.match(/\d{15,}/g) || [], days = Number(v) || 0;
+    const u = await i.client.users.fetch(optVal(i, d.target) || i.user.id), g = i.guild, m = g ? await g.members.fetch(u.id).catch(() => null) : null;
+    const ok = { 'is one of these users': ids.includes(u.id), 'is a bot': u.bot, 'is not a bot': !u.bot, 'is server owner': !!g && g.ownerId === u.id, 'is boosting': !!m?.premiumSince,
+      'account older than (days)': (Date.now() - u.createdTimestamp) / 864e5 > days, 'joined more than (days) ago': !!m?.joinedTimestamp && (Date.now() - m.joinedTimestamp) / 864e5 > days, 'is timed out': !!m?.isCommunicationDisabled?.() }[mode];
+    return fail(i, d, n, !!ok);
+  },
+  async cond_premium(i, d, c, n) { return fail(i, d, n, !!i.entitlements?.some?.(e => e.isActive?.() ?? true)); },
+  async cond_cooldown(i, d, c, n) {
+    const secs = Math.max(Number(fill(d.seconds, i)) || 0, 0);
+    const key = d.name ? 'n:' + fill(d.name, i).slice(0, 60) : `b:${c.id}:${n.id}`;
+    const until = secs ? hitCooldown(i, key, secs, scopeOf(d.scope)) : 0;
+    const msg = String(d.otherwise || '⏳ Slow down! Try again {cooldown}.').replace(/\{cooldown\}/g, until ? left(until) : '');
+    return fail(i, { ...d, otherwise: msg }, n, !until);
+  },
+  async cond_voice(i, d, c, n) {
+    needGuild(i); const m = await member(i, d.target), v = m.voice, id = idOf(i, d.channel);
+    const ok = { 'is in a voice channel': !!v?.channelId, 'is in this voice channel (ID)': !!id && v?.channelId === id, 'is server muted': !!v?.serverMute,
+      'is server deafened': !!v?.serverDeaf, 'is streaming': !!v?.streaming }[d.mode || 'is in a voice channel'];
+    return fail(i, d, n, !!ok);
+  },
+  // Saved Data: reads/writes the bot's databases (./data/users/<user>/bots/<bot>/databases/<name>.json)
+  async data(i, d, c) {
+    const bd = i.client.db, op = d.op || 'get', name = fill(d.key, i).trim().slice(0, 64), out = d.saveAs || 'data';
+    const g = i.guild?.id || 'dm', u = i.user.id;
+    const scope = { 'whole bot': 'g', 'each server': `s:${g}`, 'each user': `u:${u}`, 'each user per server': `m:${g}:${u}` }[d.scope] || 'g';
+    const dn = dbn(fill(d.db, i)) || dbn(c.database) || 'default', dbs = (bd.dbs ||= {});
+    if (op === 'keys') {                                           // names of every key stored for this scope
+      saveVar(i, out, Object.values(dbs[dn]?.entries || {}).filter(e => e.scope === scope).map(e => e.name)); return;
+    }
+    if (!name) throw new Error('Set a key for the saved data');
+    if (!dbs[dn]) {
+      if (op === 'get' || op === 'exists' || op === 'delete') { saveVar(i, out, op === 'exists' ? 'false' : ''); return; }
+      if (Object.keys(dbs).length >= 20) throw new Error('Database limit reached (20)');
+      dbs[dn] = { name: dn, entries: {} };
+    }
+    const st = dbs[dn].entries, k = `${scope}|${name}`, cur = st[k], raw = fill(d.value, i);
+    if (op === 'get') { saveVar(i, out, cur?.value ?? ''); return; }
+    if (op === 'exists') { saveVar(i, out, cur ? 'true' : 'false'); return; }
+    if (op === 'delete') { if (cur) { delete st[k]; persist(); } saveVar(i, out, ''); return; }
+    let r;
+    if (op === 'set') r = coerce(d.type, raw);
+    else if (op === 'add' || op === 'subtract') {
+      const n = Number(raw.trim().replace(',', '.'));
+      if (!Number.isFinite(n)) throw new Error(`"${raw}" is not a valid number`);
+      r = coerce('number', (Number(cur?.value) || 0) + n * (op === 'add' ? 1 : -1));
+    } else if (op === 'toggle') r = coerce('boolean', !(cur?.value === true));
+    else if (['push', 'push unique', 'remove item'].includes(op)) {
+      const list = Array.isArray(cur?.value) ? [...cur.value] : cur?.value === undefined || cur?.value === '' ? [] : [cur.value];
+      const item = coerce(infer(raw), raw).value, same = x => String(x) === String(item);
+      if (op === 'remove item') { const p = list.findIndex(same); if (p >= 0) list.splice(p, 1); }
+      else if (op === 'push' || !list.some(same)) list.push(item);
+      r = coerce('list', list);
+    } else throw new Error('Unknown database operation: ' + op);
+    if (!cur && Object.keys(st).length >= 5000) throw new Error('Saved data limit reached (5000 values)');
+    st[k] = { name, scope, type: r.type, value: r.value, at: Date.now() };
+    persist(); saveVar(i, out, r.value);
+  },
+  async cond_reacted(i, d, c, n) {
+    const m = await msgOf(i, d), uid = optVal(i, d.target) || i.user.id, e = fill(d.emoji, i).trim();
+    let ok = false;
+    for (const r of [...m.reactions.cache.values()].filter(r => emojiKey(r, e))) { if ((await r.users.fetch()).has(uid)) { ok = true; break; } }
+    return fail(i, d, n, ok);
+  }
+};
+
+// Blocks that depend on the bot's (or the user's) Discord permissions. If one of them fails, the flow stops and a message is sent:
+// the text written in the block ("Message if it fails", {error} = the reason) or an automatic one.
+const PERM_NODES = new Set(['kick', 'ban', 'unban', 'timeout', 'untimeout', 'role_add', 'role_remove', 'role_create', 'role_edit', 'role_delete', 'nickname', 'voice',
+  'purge', 'channel_create', 'channel_edit', 'channel_delete', 'channel_perms', 'server_edit', 'emoji_create', 'invite_create']);
+const friendlyError = e => {
+  const code = e && e.code, m = String((e && e.message) || '');
+  if (code === 50013 || /Missing Permissions/i.test(m)) return "I don't have permission to do that. Give my role the needed permission and put my role above the target's role.";
+  if (code === 50001 || /Missing Access/i.test(m)) return "I can't access that (missing access to the channel or server).";
+  if (code === 10007 || code === 10013 || /Unknown (Member|User)/i.test(m)) return "I couldn't find that member.";
+  if (code === 10011 || /Unknown Role/i.test(m)) return "I couldn't find that role.";
+  if (code === 10003 || /Unknown Channel/i.test(m)) return "I couldn't find that channel.";
+  return m || 'Something went wrong.';
+};
+function permError(i, n, e) {
+  const raw = friendlyError(e), custom = String((n.data || {}).errMsg || '').trim();
+  const err = new Error(custom ? custom.split('{error}').map(p => fill(p, i)).join(raw).slice(0, 2000) : raw);
+  err.custom = !!custom; err.cause = e;
+  return err;
+}
+
+// Walks the blocks. Returns 'stop' (end everything), 'break' (leave the loop) or 'skip' (next loop run).
+async function walk(i, c, from) {
+  const nodes = new Map((c.nodes || []).map(n => [n.id, n]));
+  let cur = from, guard = 0;
+  while (cur && guard++ < 500) {
+    if (++i.steps > 3000) throw new Error('Too many steps (possible infinite loop)');
+    const n = nodes.get(cur); if (!n) break;
+    if (n.type === 'loop') {
+      const d = n.data || {}, items = loopItems(i, d), prev = i.loop, delay = Math.min(Math.max(Number(d.delay) || 0, 0), 10);
+      i.inLoop = (i.inLoop || 0) + 1;
+      let out;
+      for (let k = 0; k < items.length; k++) {
+        i.loop = { index: k + 1, count: items.length, item: items[k] };
+        const r = await walk(i, c, n.next);
+        if (r === 'stop') { out = 'stop'; break; }
+        if (r === 'break') break;
+        if (delay && k < items.length - 1) await sleep(delay * 1000);
+      }
+      i.inLoop--; i.loop = prev;
+      if (out) return out;
+      cur = n.else; continue;
+    }
+    let r;
+    try { r = await exec[n.type]?.(i, n.data || {}, c, n); }
+    catch (e) { throw PERM_NODES.has(n.type) ? permError(i, n, e) : e; }      // blocks that need Discord permissions: friendly / custom message
+    if (r === 'stop' || r === 'break' || r === 'skip') return r;
+    cur = r === 'else' ? n.else : n.next;
+  }
+}
+
+async function runGraph(i, c, from) {
+  i.vars ||= {}; i.steps = 0;
+  try {
+    const r = await walk(i, c, from);
+    if (r === 'stop' || r === 'break') return;
+  } catch (e) {
+    console.error(i.ev ? `[event "${c.name}"]` : `[command /${c.name}]`, e.cause?.message || e.message);
+    if (!i.ev || e.custom) await send(i, { content: e.custom ? e.message : '❌ ' + e.message, ephemeral: true }).catch(() => {});
+    return;
+  }
+  if (!i.ev && !i.replied && !i.deferred) await i.reply({ content: '✅ Done!', ephemeral: true }).catch(() => {});
+}
+
+const OFF = 'Command disabled';
+const isOff = c => !!c && c.enabled === false;
+async function onInt(i) {
+  const db = i.client.db;
+  try {
+    if (i.isChatInputCommand()) {
+      const c = db.commands.find(x => x.name === i.commandName);
+      if (!c) return;
+      if (isOff(c)) return void i.reply({ content: OFF, ephemeral: true });
+      if (c.guildOnly && !i.guild) return void i.reply({ content: 'This only works in servers.', ephemeral: true });
+      const blocked = gate(i, c);
+      if (blocked) return void i.reply({ content: blocked, ephemeral: true });
+      await runGraph(i, c, c.start?.next);
+    } else if (i.isModalSubmit() && i.customId.startsWith('m:')) {
+      const [, cid, bid] = i.customId.split(':');
+      const c = db.commands.find(x => x.id === cid); if (!c) return;
+      if (isOff(c)) return void i.reply({ content: OFF, ephemeral: true });
+      const s = i.client.ctx?.get(`${i.user.id}:${cid}`);
+      if (s) { i.options = s.options; i.vars = { ...s.vars }; }
+      await runGraph(i, c, c.nodes.find(x => x.id === bid)?.next);
+    } else if ((i.isButton() || i.isAnySelectMenu()) && i.customId.startsWith('x:')) {
+      const [, cid, bid, xid] = i.customId.split(':');
+      const c = findCmd(db, cid);
+      const it = findItem(c?.nodes.find(x => x.id === bid)?.data?.msg, xid);
+      if (!it) return;
+      if (isOff(c)) return void i.reply({ content: OFF, ephemeral: true });
+      let resp = it.value, specific = it.value, picked = it.label || '', ids = [xid];
+      if (i.isAnySelectMenu()) {
+        let texts;
+        if (i.isStringSelectMenu()) { const o = it.options || []; texts = i.values.map(v => o[+v]?.label); resp = o[+i.values[0]]?.resp || it.response; specific = o[+i.values[0]]?.resp; ids = [...i.values.map(v => `${xid}#${v}`), xid]; }
+        else { resp = it.response; specific = ''; texts = i.values.map(v => i.isUserSelectMenu() ? `<@${v}>` : i.isRoleSelectMenu() ? `<@&${v}>` : i.isChannelSelectMenu() ? `<#${v}>` : (i.roles?.has(v) ? `<@&${v}>` : `<@${v}>`)); }
+        i.selectedText = texts.join(', '); picked = i.selectedText;
+      }
+      const s = ctxFor(i, cid);
+      if (s) { i.options = s.options; i.vars = { ...s.vars }; i.evMap = s.evMap; }
+      i.pressed = { label: picked, id: xid };
+      const trig = trigFor(c, ids);
+      if (trig) {
+        if (specific) await i.reply({ content: fill(specific, i), ephemeral: true });
+        await runGraph(i, c, trig.next);
+      } else await i.reply({ content: fill(resp || (i.isAnySelectMenu() ? '✅ {selected}' : '✅'), i), ephemeral: true });
+    } else if (i.isButton() && i.customId.startsWith('b:')) {
+      const [, cid, bid, n] = i.customId.split(':');
+      const oc = db.commands.find(x => x.id === cid);
+      if (isOff(oc)) return void i.reply({ content: OFF, ephemeral: true });
+      const d = oc?.nodes.find(x => x.id === bid)?.data || {};
+      await i.reply({ content: fill(d[`b${n}v`], i) || '✅', ephemeral: true });
+    } else if (i.isAnySelectMenu() && i.customId.startsWith('s:')) {
+      const [, cid, bid] = i.customId.split(':');
+      const oc = db.commands.find(x => x.id === cid), d = oc?.nodes.find(x => x.id === bid)?.data; if (!d) return;
+      if (isOff(oc)) return void i.reply({ content: OFF, ephemeral: true });
+      let resp = d.response, texts;
+      if (i.isStringSelectMenu()) { const o = selOpts(d); texts = i.values.map(v => o[+v]?.label); resp = o[+i.values[0]]?.resp || d.response; }
+      else texts = i.values.map(v => i.isUserSelectMenu() ? `<@${v}>` : i.isRoleSelectMenu() ? `<@&${v}>` : i.isChannelSelectMenu() ? `<#${v}>` : (i.roles?.has(v) ? `<@&${v}>` : `<@${v}>`));
+      i.selectedText = texts.join(', ');
+      await i.reply({ content: fill(resp || '✅ {selected}', i), ephemeral: !!d.ephemeral });
+    }
+  } catch (e) { console.error(e); }
+}
+
+
+// ---------------------------------------------------------------------------
+// Events: every Discord event below can be used as a trigger in the dashboard
+// ---------------------------------------------------------------------------
+const SELF = ['message_create', 'message_edit', 'reaction_add', 'reaction_remove'];   // never react to the bot itself (avoids loops)
+const ids = s => String(s || '').match(/\d{15,}/g) || [];
+const mem = (u, m, g) => !u ? {} : ({
+  member: `<@${u.id}>`, 'member.name': u.username, 'member.id': u.id, 'member.tag': u.tag, 'member.avatar': u.displayAvatarURL({ size: 256 }),
+  'member.nickname': m?.nickname || u.username, 'member.created': unix(u.createdTimestamp), 'member.joined': unix(m?.joinedTimestamp), 'member.count': g?.memberCount ?? ''
+});
+const msg = m => ({
+  'message.id': m.id, 'message.content': m.content ?? '', 'message.url': m.url ?? '',
+  'message.author': m.author ? `<@${m.author.id}>` : '', 'message.author.name': m.author?.username ?? '', 'message.author.id': m.author?.id ?? '',
+  'message.channel': `<#${m.channelId}>`, 'message.channel.id': m.channelId, 'message.channel.name': m.channel?.name ?? '',
+  'message.attachments': m.attachments?.size ?? 0, 'message.attachment': m.attachments?.first?.()?.url ?? ''
+});
+const chn = ch => ({ 'channel.id': ch.id, 'channel.name': ch.name ?? '', 'channel.type': ChannelType[ch.type] ?? '', 'channel.category': ch.parent?.name ?? '', 'channel.topic': ch.topic ?? '' });
+const rol = r => ({ role: `<@&${r.id}>`, 'role.id': r.id, 'role.name': r.name, 'role.color': r.hexColor });
+const thr = t => ({ thread: `<#${t.id}>`, 'thread.id': t.id, 'thread.name': t.name, 'thread.parent': t.parentId ? `<#${t.parentId}>` : '', 'thread.parent.id': t.parentId ?? '', 'thread.owner': t.ownerId ? `<@${t.ownerId}>` : '' });
+const inv = i => ({ 'invite.code': i.code, 'invite.url': i.url ?? `https://discord.gg/${i.code}`, 'invite.inviter': i.inviter ? `<@${i.inviter.id}>` : '', 'invite.channel': i.channelId ? `<#${i.channelId}>` : '', 'invite.uses': i.uses ?? 0 });
+const textCh = ch => ch?.isTextBased?.() && ch.send ? ch : null;
+
+const has = (c, name) => (c.db.events || []).some(e => e.enabled !== false && e.event === name);
+const NOMOD = { moderator: '', 'moderator.name': '', 'moderator.id': '', reason: '' };
+// who did it (and why), read from the audit log. Needs the "View Audit Log" permission; returns null when not found.
+async function audit(guild, type, targetId, pred = () => true) {
+  try {
+    await sleep(900);
+    const logs = await guild.fetchAuditLogs({ type, limit: 8 });
+    const e = logs.entries.find(x => x.targetId === targetId && Date.now() - x.createdTimestamp < 20000 && pred(x));
+    if (!e) return null;
+    const u = e.executor;
+    return { reason: e.reason ?? '', map: { moderator: u ? `<@${u.id}>` : '', 'moderator.name': u?.username ?? '', 'moderator.id': u?.id ?? '', reason: e.reason ?? '' } };
+  } catch { return null; }
+}
+// Discord sends no event when a timeout simply runs out, so a timer watches it
+function watchTimeout(c, m) {
+  const tm = (c.tmo ||= new Map()), k = m.guild.id + ':' + m.id;
+  clearTimeout(tm.get(k));
+  const ms = m.communicationDisabledUntilTimestamp - Date.now(); if (ms <= 0) return;
+  tm.set(k, setTimeout(async () => {
+    tm.delete(k);
+    const f = await m.guild.members.fetch({ user: m.id, force: true }).catch(() => null); if (!f) return;
+    const until = f.communicationDisabledUntilTimestamp || 0;
+    if (until > Date.now() + 1500) return watchTimeout(c, f);          // extended, or the 24-day timer limit was hit
+    fire(c, 'member_untimeout', { guild: f.guild, user: f.user, member: f, map: { ...mem(f.user, f, f.guild), ...NOMOD, 'timeout.ended': 'expired' } });
+  }, Math.min(ms + 1500, 2 ** 31 - 1)));
+}
+const emj = e => ({ emoji: e.toString(), 'emoji.name': e.name ?? '', 'emoji.id': e.id, 'emoji.url': e.imageURL?.() ?? e.url ?? '' });
+
+async function fire(client, name, o) {
+  const list = (client.db.events || []).filter(e => e.enabled !== false && e.event === name);
+  if (!list.length || !o.guild) return;
+  if (SELF.includes(name) && o.user?.id === client.user.id) return;
+  o.map ||= {};
+  for (const c of list) {
+    try {
+      if (c.ignoreBots !== false && o.user?.bot) continue;
+      const here = [o.channelId, o.channel?.id, o.channel?.parentId].filter(Boolean);
+      const only = ids(c.onlyChannel); if (only.length && !only.some(x => here.includes(x))) continue;
+      const roles = ids(c.onlyRole); if (roles.length && !o.member?.roles?.cache?.some(r => roles.includes(r.id))) continue;
+      const kw = String(c.contains || '').split('\n').map(x => x.trim().toLowerCase()).filter(Boolean);
+      if (kw.length && !kw.some(k => String(o.map['message.content'] || '').toLowerCase().includes(k))) continue;
+      const em = String(c.emoji || '').split(/\s+/).filter(Boolean);
+      if (em.length && !em.some(e => (o.emojis || []).includes(e))) continue;
+      const tid = ids(c.channel)[0];
+      let t = tid ? await client.channels.fetch(tid).catch(() => null) : null;
+      t ||= textCh(o.channel); t ||= o.guild.systemChannel ?? null;
+      const i = { ev: name, client, guild: o.guild, user: o.user || client.user, channelId: o.channelId ?? o.channel?.id ?? t?.id, channel: o.channel ?? t, target: t,
+        evMap: o.map, message: o.message, memberPermissions: o.member?.permissions, vars: {} };
+      runGraph(i, c, c.start?.next).catch(e => console.error(`[event "${c.name}"]`, e.message));
+    } catch (e) { console.error(`[event "${c.name}"]`, e.message); }
+  }
+}
+
+const reac = name => async (c, r, u) => {
+  if (r.partial) r = await r.fetch().catch(() => r);
+  if (r.message.partial) await r.message.fetch().catch(() => {});
+  const m = r.message; if (!m.guild) return;
+  if (u.partial) u = await u.fetch().catch(() => u);
+  const member = await m.guild.members.fetch(u.id).catch(() => null);
+  return fire(c, name, { guild: m.guild, user: u, member, channelId: m.channelId, channel: m.channel, message: m,
+    emojis: [r.emoji.toString(), r.emoji.name, r.emoji.id].filter(Boolean),
+    map: { ...mem(u, member, m.guild), ...msg(m), 'reaction.emoji': r.emoji.toString(), 'reaction.emoji.name': r.emoji.name ?? '', 'reaction.emoji.id': r.emoji.id ?? '', 'reaction.count': r.count ?? '' } });
+};
+const vc = ch => ({ 'voice.channel': ch ? `<#${ch.id}>` : '', 'voice.channel.id': ch?.id ?? '', 'voice.channel.name': ch?.name ?? '' });
+const ban = (name, type) => async (c, b) => {
+  if (b.partial) b = await b.fetch().catch(() => b);
+  const a = has(c, name) ? await audit(b.guild, type, b.user.id) : null;
+  return fire(c, name, { guild: b.guild, user: b.user, map: { ...mem(b.user, null, b.guild), ...(a?.map ?? NOMOD), 'ban.reason': b.reason ?? a?.reason ?? '' } });
+};
+
+// discord.js event name -> handler (client, ...args)
+const LISTEN = {
+  guildMemberAdd: (c, m) => fire(c, 'member_join', { guild: m.guild, user: m.user, member: m, map: mem(m.user, m, m.guild) }),
+  async guildMemberRemove(c, m) {
+    await fire(c, 'member_leave', { guild: m.guild, user: m.user, member: m, map: mem(m.user, m, m.guild) });
+    if (!has(c, 'member_kick')) return;
+    const a = await audit(m.guild, AuditLogEvent.MemberKick, m.id);
+    if (a) await fire(c, 'member_kick', { guild: m.guild, user: m.user, member: m, map: { ...mem(m.user, m, m.guild), ...a.map } });
+  },
+  guildBanAdd: ban('member_ban', AuditLogEvent.MemberBanAdd),
+  guildBanRemove: ban('member_unban', AuditLogEvent.MemberBanRemove),
+  async guildMemberUpdate(c, o, n) {
+    if (o.partial) return;
+    const base = { guild: n.guild, user: n.user, member: n }, M = mem(n.user, n, n.guild);
+    for (const [id, r] of n.roles.cache) if (!o.roles.cache.has(id)) await fire(c, 'member_role_add', { ...base, map: { ...M, ...rol(r) } });
+    for (const [id, r] of o.roles.cache) if (!n.roles.cache.has(id)) await fire(c, 'member_role_remove', { ...base, map: { ...M, ...rol(r) } });
+    if ((o.nickname || '') !== (n.nickname || '')) await fire(c, 'member_nickname', { ...base, map: { ...M, 'member.old.nickname': o.nickname || '', 'member.new.nickname': n.nickname || '' } });
+    if (!o.premiumSince && n.premiumSince) await fire(c, 'member_boost', { ...base, map: { ...M, 'server.boosts': n.guild.premiumSubscriptionCount ?? '' } });
+    const ot = o.communicationDisabledUntilTimestamp || 0, nt = n.communicationDisabledUntilTimestamp || 0, now = Date.now();
+    const byTimeout = x => x.changes?.some(ch => ch.key === 'communication_disabled_until');
+    if (nt > now && nt !== ot) {
+      const a = has(c, 'member_timeout') ? await audit(n.guild, AuditLogEvent.MemberUpdate, n.id, byTimeout) : null;
+      await fire(c, 'member_timeout', { ...base, map: { ...M, ...(a?.map ?? NOMOD), 'timeout.until': unix(nt), 'timeout.minutes': Math.max(Math.round((nt - now) / 60000), 1) } });
+      if (has(c, 'member_untimeout')) watchTimeout(c, n);
+    } else if (ot > now && nt <= now) {
+      const tm = c.tmo, k = n.guild.id + ':' + n.id; if (tm) { clearTimeout(tm.get(k)); tm.delete(k); }
+      const a = has(c, 'member_untimeout') ? await audit(n.guild, AuditLogEvent.MemberUpdate, n.id, byTimeout) : null;
+      await fire(c, 'member_untimeout', { ...base, map: { ...M, ...(a?.map ?? NOMOD), 'timeout.ended': 'removed' } });
+    }
+  },
+  presenceUpdate: (c, o, n) => n.guild && o?.status !== n.status && fire(c, 'presence_update', { guild: n.guild, user: n.user, member: n.member,
+    map: { ...mem(n.user, n.member, n.guild), 'presence.old': o?.status ?? 'offline', 'presence.new': n.status } }),
+  messageCreate: (c, m) => m.guild && fire(c, 'message_create', { guild: m.guild, user: m.author, member: m.member, channelId: m.channelId, channel: m.channel, message: m,
+    map: { ...mem(m.author, m.member, m.guild), ...msg(m) } }),
+  async messageUpdate(c, o, n) {
+    if (n.partial) n = await n.fetch().catch(() => n);
+    if (!n.guild || (o.content != null && o.content === n.content)) return;      // ignore embed-only updates
+    return fire(c, 'message_edit', { guild: n.guild, user: n.author, member: n.member, channelId: n.channelId, channel: n.channel, message: n,
+      map: { ...mem(n.author, n.member, n.guild), ...msg(n), 'message.old': o.content ?? '' } });
+  },
+  messageDelete: (c, m) => m.guild && fire(c, 'message_delete', { guild: m.guild, user: m.author, member: m.member, channelId: m.channelId, channel: m.channel, message: m,
+    map: { ...mem(m.author, m.member, m.guild), ...msg(m) } }),
+  async messageReactionAdd(c, r, u) {
+    await reactTrigger(c, r, u).catch(e => console.error('[reaction trigger]', e.message));
+    return reac('reaction_add')(c, r, u);
+  },
+  messageReactionRemove: reac('reaction_remove'),
+  async voiceStateUpdate(c, o, n) {
+    const base = { guild: n.guild, user: n.member?.user, member: n.member }, M = mem(base.user, n.member, n.guild);
+    if (!o.channelId && n.channelId) return fire(c, 'voice_join', { ...base, channelId: n.channelId, channel: n.channel, map: { ...M, ...vc(n.channel) } });
+    if (o.channelId && !n.channelId) return fire(c, 'voice_leave', { ...base, channelId: o.channelId, channel: o.channel, map: { ...M, ...vc(o.channel) } });
+    if (o.channelId && n.channelId && o.channelId !== n.channelId)
+      return fire(c, 'voice_move', { ...base, channelId: n.channelId, channel: n.channel, map: { ...M, ...vc(n.channel), 'voice.old': `<#${o.channelId}>`, 'voice.old.id': o.channelId, 'voice.old.name': o.channel?.name ?? '' } });
+    if (o.channelId && o.channelId === n.channelId) {
+      const V = { ...M, ...vc(n.channel), 'voice.self.muted': String(!!n.selfMute), 'voice.self.deafened': String(!!n.selfDeaf) }, e = { ...base, channelId: n.channelId, channel: n.channel };
+      if (!!o.serverMute !== !!n.serverMute) await fire(c, 'voice_mute', { ...e, map: { ...V, 'voice.muted': String(!!n.serverMute) } });
+      if (!!o.serverDeaf !== !!n.serverDeaf) await fire(c, 'voice_deafen', { ...e, map: { ...V, 'voice.deafened': String(!!n.serverDeaf) } });
+    }
+  },
+  channelCreate: (c, ch) => ch.guild && fire(c, 'channel_create', { guild: ch.guild, channelId: ch.id, channel: textCh(ch), map: chn(ch) }),
+  channelDelete: (c, ch) => ch.guild && fire(c, 'channel_delete', { guild: ch.guild, channelId: ch.id, map: chn(ch) }),
+  channelUpdate: (c, o, n) => n.guild && fire(c, 'channel_update', { guild: n.guild, channelId: n.id, channel: textCh(n), map: { ...chn(n), 'channel.old.name': o.name ?? '' } }),
+  roleCreate: (c, r) => fire(c, 'role_create', { guild: r.guild, map: rol(r) }),
+  roleDelete: (c, r) => fire(c, 'role_delete', { guild: r.guild, map: rol(r) }),
+  roleUpdate: (c, o, n) => fire(c, 'role_update', { guild: n.guild, map: { ...rol(n), 'role.old.name': o.name } }),
+  async threadCreate(c, t, newly) {
+    if (!newly || !t.guild) return;
+    const user = t.ownerId ? await c.users.fetch(t.ownerId).catch(() => null) : null, member = t.ownerId ? await t.guild.members.fetch(t.ownerId).catch(() => null) : null;
+    await t.join?.().catch(() => {});
+    return fire(c, 'thread_create', { guild: t.guild, user, member, channelId: t.id, channel: t, map: { ...mem(user, member, t.guild), ...thr(t) } });
+  },
+  threadDelete: (c, t) => t.guild && fire(c, 'thread_delete', { guild: t.guild, channelId: t.parentId, channel: textCh(t.parent), map: thr(t) }),
+  inviteCreate: (c, i) => i.guild && fire(c, 'invite_create', { guild: i.guild, user: i.inviter, channelId: i.channelId, channel: textCh(i.channel), map: { ...mem(i.inviter, null, i.guild), ...inv(i) } }),
+  inviteDelete: (c, i) => i.guild && fire(c, 'invite_delete', { guild: i.guild, channelId: i.channelId, channel: textCh(i.channel), map: inv(i) }),
+  guildCreate: (c, g) => fire(c, 'bot_join', { guild: g, map: {} }),
+  messageDeleteBulk: (c, msgs, ch) => ch.guild && fire(c, 'message_bulk_delete', { guild: ch.guild, channelId: ch.id, channel: textCh(ch), map: { ...chn(ch), 'bulk.count': msgs.size } }),
+  emojiCreate: (c, e) => fire(c, 'emoji_create', { guild: e.guild, map: emj(e) }),
+  emojiDelete: (c, e) => fire(c, 'emoji_delete', { guild: e.guild, map: emj(e) })
+};
+
+async function start(db) {
+  await stop(db.id);
+  if (!db.settings.token) throw new Error('Enter the bot token');
+  const I = db.settings.intents || {}, G = GatewayIntentBits;
+  // non-privileged intents are always on so every event works; privileged ones come from Settings
+  const intents = [G.Guilds, G.GuildMessages, G.GuildMessageReactions, G.GuildVoiceStates, G.GuildModeration, G.GuildInvites, G.DirectMessageReactions];
+  const ex = G.GuildExpressions ?? G.GuildEmojisAndStickers; if (ex) intents.push(ex);
+  if (I.members) intents.push(G.GuildMembers);
+  if (I.presence) intents.push(G.GuildPresences);
+  if (I.message) intents.push(G.MessageContent);
+  const client = new Client({ intents, allowedMentions: { parse: ['users', 'roles'] }, partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User, Partials.GuildMember] });
+  client.db = db;
+  client.on('interactionCreate', onInt);
+  for (const [ev, fn] of Object.entries(LISTEN)) client.on(ev, (...a) => Promise.resolve().then(() => fn(client, ...a)).catch(e => console.error(`[${ev}]`, e.message)));
+  client.on('error', e => console.error('[client error]', e?.message || e));       // an unhandled 'error' event would kill the whole program
+  client.on('shardError', e => console.error('[shard error]', e?.message || e));
+  try {
+    await withTimeout(client.login(db.settings.token), 30000, 'Discord did not answer the login in time. Try again.');
+    if (!client.isReady()) await withTimeout(new Promise(r => client.once('ready', r)), 30000, 'The bot did not become ready in time. Try again.');
+  } catch (e) {
+    try { await client.destroy(); } catch {}
+    throw new Error(/disallowed intents/i.test(e.message) ? 'Enable the same intents in the Discord Developer Portal (Bot → Privileged Gateway Intents) or turn them off here' : e.message);
+  }
+  clients.set(db.id, client);
+  syncState.delete(db.id);
+  presence(client, db.settings); refresh(db);       // commands sync in the background
+}
+async function stop(id) { clearTimeout(refreshT.get(id)); refreshT.delete(id); const c = clients.get(id); if (c) { clients.delete(id); c.tmo?.forEach(t => clearTimeout(t)); try { await c.destroy(); } catch {} } }
+const status = id => { const c = clients.get(id), s = syncState.get(id); return { running: !!c?.isReady(), tag: c?.user?.tag || null, syncing: !!s?.busy, syncError: s?.error || '' }; };
+
+// Returns immediately; syncing the slash commands with Discord happens in the background (one at a time, latest state wins).
+// force = true re-sends the commands even if nothing changed.
+const refreshT = new Map();
+function refresh(db, force = false) {
+  const c = clients.get(db.id);
+  if (!c?.isReady()) return Promise.resolve();
+  c.db = db;
+  try { presence(c, db.settings); } catch (e) { console.error('[presence]', e.message); }
+  if (force) stOf(db.id).force = true;
+  clearTimeout(refreshT.get(db.id));
+  const t = setTimeout(() => { refreshT.delete(db.id); runSync(db); }, force ? 0 : 2500);
+  t.unref?.(); refreshT.set(db.id, t);
+  return Promise.resolve();
+}
+function runSync(db) {
+  const c = clients.get(db.id);
+  if (!c?.isReady()) return;
+  const st = stOf(db.id);
+  if (st.busy) { st.again = true; return; }
+  st.busy = true;
+  (async () => {
+    do {
+      st.again = false;
+      const f = st.force; st.force = false;
+      try { await withTimeout(sync(c, c.db, f), 30000, 'O Discord demorou demais para responder ao sincronizar os comandos.'); st.error = ''; }
+      catch (e) {
+        if (isNet(e)) {                              // network hiccup: try again by itself in 15 s (nothing is lost)
+          st.error = 'Sem conexão com o Discord agora. Tentando de novo automaticamente...';
+          const t = setTimeout(() => { refreshT.delete(db.id); runSync(db); }, 15000); t.unref?.(); refreshT.set(db.id, t);
+        } else st.error = /rate/i.test(String(e.name) + String(e.message))
+          ? 'O Discord está limitando atualizações de comandos. Suas mudanças foram salvas e sincronizam no próximo save.'
+          : discordErr(e).slice(0, 600);
+        console.error(`[sync ${db.name}]`, st.error);
+      }
+    } while (st.again);
+    st.busy = false;
+  })();
+}
+const NETERR = new Set(['EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT']);
+const isNet = e => NETERR.has(e?.code) || NETERR.has(e?.cause?.code) || /EAI_AGAIN|handshake has timed out|ETIMEDOUT|ECONNRESET|fetch failed/i.test(String(e?.message));
+// temporary network failures (DNS not ready, cloud host busy) are retried a few times before giving up
+const dfetch = async (url, opt) => {
+  let last;
+  for (let n = 0; n < 4; n++) {
+    try { return await fetch(url, { ...opt, signal: AbortSignal.timeout(15000) }); }
+    catch (e) {
+      last = e;
+      if (!isNet(e) && e.name !== 'TimeoutError' && e.name !== 'AbortError') break;
+      await sleep(600 * (n + 1));
+    }
+  }
+  const t = last && (last.name === 'TimeoutError' || last.name === 'AbortError');
+  throw new Error(t ? 'Discord did not answer in time. Try again.' : /EAI_AGAIN/.test(String(last?.cause?.code || last?.message)) ? 'Could not reach Discord (DNS). The host network is busy, try again in a moment.' : (last?.message || 'Network error'));
+};
+
+async function info(token) {
+  const r = await dfetch('https://discord.com/api/v10/users/@me', { headers: { Authorization: 'Bot ' + token } });
+  if (!r.ok) throw new Error('Invalid token');
+  const u = await r.json();
+  return { id: u.id, name: u.username, banner: u.banner ? `https://cdn.discordapp.com/banners/${u.id}/${u.banner}.png?size=600` : '', avatar: u.avatar ? `https://cdn.discordapp.com/avatars/${u.id}/${u.avatar}.png?size=128` : `https://cdn.discordapp.com/embed/avatars/${Number(BigInt(u.id) >> 22n) % 6}.png` };
+}
+const dc = async (token, method, path, body) => {
+  const r = await dfetch('https://discord.com/api/v10' + path, { method, headers: { Authorization: 'Bot ' + token, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const det = Object.values(j.errors || {}).flatMap(function f(x) { return x?._errors ? x._errors.map(e => e.message) : []; });
+    throw new Error(det[0] || j.message || 'Discord error ' + r.status);
+  }
+  return j;
+};
+const about = async token => (await dc(token, 'GET', '/applications/@me')).description || '';
+async function profile(token, p) {
+  const u = {}; if (p.name) u.username = p.name;
+  if (p.avatar !== undefined) u.avatar = p.avatar;
+  if (p.banner !== undefined) u.banner = p.banner;
+  if (Object.keys(u).length) await dc(token, 'PATCH', '/users/@me', u);
+  if (p.description !== undefined) await dc(token, 'PATCH', '/applications/@me', { description: p.description });
+}
+module.exports = { start, stop, status, refresh, info, about, profile, setSaver };

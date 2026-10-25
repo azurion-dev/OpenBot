@@ -16,7 +16,11 @@
 // its owner (b.owner); the other accounts only keep a link in user.json -> botLinks: [{ owner, id }].
 //
 // An old single-file data.json is converted automatically on first start (and kept as data.json.migrated).
+//
+// IMPORTANT (cloud hosts): saveAsync() NEVER blocks the event loop. It serializes in memory, then writes ONE file at a time with
+// fs.promises and yields between files, so Discord heartbeats / DNS lookups keep working while saving. save() (sync) is only for shutdown.
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
+const fsp = fs.promises;
 
 const ROOT = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const USERS = path.join(ROOT, 'users'), SESS = path.join(ROOT, 'sessions.json'), MARK = path.join(ROOT, '.migrated');
@@ -180,8 +184,12 @@ function load() {
 }
 
 // ---------- save ----------
+const RETRY = ['EPERM', 'EBUSY', 'EACCES', 'EMFILE', 'ENFILE'];
 const sleepSync = ms => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {} };
-// returns true when the file is really on disk
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const yieldLoop = () => new Promise(r => setImmediate(r));   // lets Discord / HTTP / DNS work between two files
+
+// ----- SYNC writer (only used when the program is closing) -----
 function write(f, t) {
   let last;
   try { fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 }); } catch (e) { last = e; }
@@ -189,16 +197,16 @@ function write(f, t) {
   for (let n = 0; n < 5; n++) {
     try {
       fs.writeFileSync(tmp, t, { mode: 0o600 });
-      try { if (seen.get(f)) fs.copyFileSync(f, f + '.bak'); } catch {}      // previous good version
+      try { if (seen.get(f)) fs.copyFileSync(f, f + '.bak'); } catch {}
       fs.renameSync(tmp, f); seen.set(f, t); return true;
     } catch (e) {
       last = e;
-      if (!['EPERM', 'EBUSY', 'EACCES', 'EMFILE', 'ENFILE'].includes(e.code)) break;
-      sleepSync(30 * (n + 1));                                         // file briefly locked: wait and retry
+      if (!RETRY.includes(e.code)) break;
+      sleepSync(30 * (n + 1));
     }
   }
   try { fs.unlinkSync(tmp); } catch {}
-  try { fs.writeFileSync(f, t, { mode: 0o600 }); seen.set(f, t); return true; } catch (e) { last = e; }   // last resort: write in place
+  try { fs.writeFileSync(f, t, { mode: 0o600 }); seen.set(f, t); return true; } catch (e) { last = e; }
   console.error('Could not write', f, last && last.message);
   return false;
 }
@@ -207,10 +215,39 @@ function remove(f) {
   seen.delete(f);
   for (let d = path.dirname(f); d.startsWith(USERS) && d !== USERS; d = path.dirname(d)) { try { fs.rmdirSync(d); } catch { break; } }
 }
-let lastErrors = 0;
-function save(db) {
-  const out = new Map(), put = (f, v) => { try { out.set(f, JSON.stringify(v, null, 2)); } catch (e) { lastErrors++; console.error('Could not serialize', f, e.message); } };
-  lastErrors = 0;
+
+// ----- ASYNC writer (normal operation: never blocks the event loop) -----
+async function writeAsync(f, t) {
+  let last;
+  const tmp = f + '.' + process.pid + '.tmp';
+  for (let n = 0; n < 5; n++) {
+    try {
+      await fsp.mkdir(path.dirname(f), { recursive: true, mode: 0o700 });
+      await fsp.writeFile(tmp, t, { mode: 0o600 });
+      if (seen.get(f)) { try { await fsp.copyFile(f, f + '.bak'); } catch {} }   // previous good version
+      await fsp.rename(tmp, f); seen.set(f, t); return true;
+    } catch (e) {
+      last = e;
+      if (!RETRY.includes(e.code)) break;
+      await sleep(30 * (n + 1));                                       // file briefly locked: wait (without blocking) and retry
+    }
+  }
+  try { await fsp.unlink(tmp); } catch {}
+  try { await fsp.writeFile(f, t, { mode: 0o600 }); seen.set(f, t); return true; } catch (e) { last = e; }   // last resort: write in place
+  console.error('Could not write', f, last && last.message);
+  return false;
+}
+async function removeAsync(f) {
+  try { await fsp.unlink(f); } catch {}
+  seen.delete(f);
+  for (let d = path.dirname(f); d.startsWith(USERS) && d !== USERS; d = path.dirname(d)) { try { await fsp.rmdir(d); } catch { break; } }
+}
+
+// turns the in-memory database into a Map(file -> text). Fully synchronous = a consistent snapshot, nothing can change in the middle.
+function build(db) {
+  const out = new Map();
+  let errs = 0;
+  const put = (f, v) => { try { out.set(f, JSON.stringify(v, null, 2)); } catch (e) { errs++; console.error('Could not serialize', f, e.message); } };
   put(SESS, db.sessions || {});
   // every bot must have exactly one owner that really has it in its list (otherwise the first account that has it takes it)
   for (const [u, user] of Object.entries(db.users || {})) for (const b of user.bots || []) {
@@ -233,15 +270,39 @@ function save(db) {
         for (const c of commands) if (ok(c.id)) put(path.join(base, 'commands', c.id + '.json'), c);
         for (const c of events) if (ok(c.id)) put(path.join(base, 'events', c.id + '.json'), c);
         for (const [n, t] of Object.entries(dbs)) if (ok(n)) put(path.join(base, 'databases', n + '.json'), { name: n, entries: t.entries || {} });
-      } catch (e) { lastErrors++; console.error('Could not prepare bot', b && b.id, e.message); }
+      } catch (e) { errs++; console.error('Could not prepare bot', b && b.id, e.message); }
     }
   }
-  let failed = lastErrors;
-  for (const [f, t] of out) if (seen.get(f) !== t && !write(f, t)) failed++;
-  // deleting files: only when everything above went fine, and never "wipe everything" because the memory looks empty
+  return { out, errs };
+}
+
+// deleting files: only when everything went fine, and never "wipe everything" because the memory looks empty
+function planDelete(out, failed) {
   const known = [...seen.keys()].filter(f => f.startsWith(USERS)), gone = known.filter(f => !out.has(f));
-  if (failed === 0 && !(known.length > 3 && gone.length === known.length)) for (const f of gone) remove(f);
-  else if (gone.length) console.warn('Skipped deleting', gone.length, 'file(s) for safety (save had errors or everything looked empty).');
+  if (failed === 0 && !(known.length > 3 && gone.length === known.length)) return gone;
+  if (gone.length) console.warn('Skipped deleting', gone.length, 'file(s) for safety (save had errors or everything looked empty).');
+  return [];
+}
+
+// SYNC save: only for shutdown / first migration
+function save(db) {
+  const { out, errs } = build(db);
+  let failed = errs;
+  for (const [f, t] of out) if (seen.get(f) !== t && !write(f, t)) failed++;
+  for (const f of planDelete(out, failed)) remove(f);
+  return { ok: failed === 0, failed };
+}
+
+// ASYNC save: normal operation. Only changed files are written, one at a time, yielding to the event loop between files.
+async function saveAsync(db) {
+  const { out, errs } = build(db);
+  let failed = errs;
+  for (const [f, t] of out) {
+    if (seen.get(f) === t) continue;
+    if (!(await writeAsync(f, t))) failed++;
+    await yieldLoop();
+  }
+  for (const f of planDelete(out, failed)) { await removeAsync(f); await yieldLoop(); }
   return { ok: failed === 0, failed };
 }
 
@@ -257,4 +318,4 @@ function finishMigration() {
   } catch (e) { console.error('Migration cleanup failed:', e.message); }
 }
 
-module.exports = { load, save, finishMigration, coerce, infer, TYPES, ROOT, ok };
+module.exports = { load, save, saveAsync, finishMigration, coerce, infer, TYPES, ROOT, ok };

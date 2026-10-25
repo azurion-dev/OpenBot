@@ -1,10 +1,12 @@
 const { Client, GatewayIntentBits, Partials, REST, Routes, PermissionsBitField, ChannelType, AuditLogEvent } = require('discord.js');
 const { coerce, infer } = require('./storage');
 const net = require('net'), dns = require('dns'), http = require('http'), https = require('https');
+try { dns.setDefaultResultOrder('ipv4first'); } catch {}   // many cloud hosts have broken IPv6: this avoids EAI_AGAIN / handshake timeouts
 
 // ---------- safe outgoing HTTP (used by the "API request" block) ----------
 // Blocks private / loopback / link-local / cloud-metadata addresses. The check is done on the IP that is REALLY connected to
 // (so DNS tricks and DNS rebinding do not work) and again on every redirect.
+try { dns.setDefaultResultOrder('ipv4first'); } catch {}   // many cloud hosts have broken IPv6: this avoids EAI_AGAIN / handshake timeouts
 const BAD = new net.BlockList();
 for (const [a, p] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4]]) BAD.addSubnet(a, p, 'ipv4');
 for (const [a, p] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8], ['64:ff9b::', 96], ['2001:db8::', 32]]) BAD.addSubnet(a, p, 'ipv6');
@@ -1269,7 +1271,8 @@ async function start(db) {
   if (I.members) intents.push(G.GuildMembers);
   if (I.presence) intents.push(G.GuildPresences);
   if (I.message) intents.push(G.MessageContent);
-  const client = new Client({ intents, allowedMentions: { parse: ['users', 'roles'] }, partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User, Partials.GuildMember] });
+  const client = new Client({ intents, allowedMentions: { parse: ['users', 'roles'] }, partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User, Partials.GuildMember],
+  rest: { timeout: 30000, retries: 3 }, ws: { handshakeTimeout: 60000, helloTimeout: 60000, readyTimeout: 60000 } });
   client.db = db;
   client.on('interactionCreate', onInt);
   for (const [ev, fn] of Object.entries(LISTEN)) client.on(ev, (...a) => Promise.resolve().then(() => fn(client, ...a)).catch(e => console.error(`[${ev}]`, e.message)));
@@ -1284,29 +1287,41 @@ async function start(db) {
   }
   clients.set(db.id, client);
   syncState.delete(db.id);
-  presence(client, db.settings); refresh(db);       // commands sync in the background
+  presence(client, db.settings); refresh(db, true);       // commands sync in the background
 }
-async function stop(id) { const c = clients.get(id); if (c) { clients.delete(id); c.tmo?.forEach(t => clearTimeout(t)); try { await c.destroy(); } catch {} } }
+async function stop(id) { clearTimeout(refreshT.get(id)); refreshT.delete(id); const c = clients.get(id); if (c) { clients.delete(id); c.tmo?.forEach(t => clearTimeout(t)); try { await c.destroy(); } catch {} } }
 const status = id => { const c = clients.get(id), s = syncState.get(id); return { running: !!c?.isReady(), tag: c?.user?.tag || null, syncing: !!s?.busy, syncError: s?.error || '' }; };
 
-// Returns immediately; syncing the slash commands with Discord happens in the background (one at a time, latest state wins).
-// force = true re-sends the commands even if nothing changed.
+// Returns immediately. The sync with Discord is DEBOUNCED: saving many times in a row = ONE sync, 2.5 s after the last change.
+// (This avoids hammering Discord + the host while you edit fast.) force = true syncs right now even if nothing changed.
+const refreshT = new Map();
 function refresh(db, force = false) {
   const c = clients.get(db.id);
   if (!c?.isReady()) return Promise.resolve();
   c.db = db;
   try { presence(c, db.settings); } catch (e) { console.error('[presence]', e.message); }
+  if (force) stOf(db.id).force = true;
+  clearTimeout(refreshT.get(db.id));
+  const t = setTimeout(() => { refreshT.delete(db.id); runSync(db); }, force ? 0 : 2500);
+  t.unref?.(); refreshT.set(db.id, t);
+  return Promise.resolve();
+}
+function runSync(db) {
+  const c = clients.get(db.id);
+  if (!c?.isReady()) return;
   const st = stOf(db.id);
-  if (force) st.force = true;
-  if (st.busy) { st.again = true; return Promise.resolve(); }
+  if (st.busy) { st.again = true; return; }
   st.busy = true;
   (async () => {
     do {
       st.again = false;
       const f = st.force; st.force = false;
-      try { await withTimeout(sync(c, db, f), 30000, 'O Discord demorou demais para responder ao sincronizar os comandos.'); st.error = ''; }
+      try { await withTimeout(sync(c, c.db, f), 30000, 'O Discord demorou demais para responder ao sincronizar os comandos.'); st.error = ''; }
       catch (e) {
-        st.error = /rate/i.test(String(e.name) + String(e.message))
+        if (isNet(e)) {                              // network hiccup: try again by itself in 15 s (nothing is lost)
+          st.error = 'Sem conexão com o Discord agora. Tentando de novo automaticamente...';
+          const t = setTimeout(() => { refreshT.delete(db.id); runSync(db); }, 15000); t.unref?.(); refreshT.set(db.id, t);
+        } else st.error = /rate/i.test(String(e.name) + String(e.message))
           ? 'O Discord está limitando atualizações de comandos. Suas mudanças foram salvas e sincronizam no próximo save.'
           : discordErr(e).slice(0, 600);
         console.error(`[sync ${db.name}]`, st.error);
@@ -1314,12 +1329,48 @@ function refresh(db, force = false) {
     } while (st.again);
     st.busy = false;
   })();
-  return Promise.resolve();
 }
+function runSync(db) {
+  const c = clients.get(db.id);
+  if (!c?.isReady()) return;
+  const st = stOf(db.id);
+  if (st.busy) { st.again = true; return; }
+  st.busy = true;
+  (async () => {
+    do {
+      st.again = false;
+      const f = st.force; st.force = false;
+      try { await withTimeout(sync(c, c.db, f), 30000, 'O Discord demorou demais para responder ao sincronizar os comandos.'); st.error = ''; }
+      catch (e) {
+        if (isNet(e)) {                              // network hiccup: try again by itself in 15 s (nothing is lost)
+          st.error = 'Sem conexão com o Discord agora. Tentando de novo automaticamente...';
+          const t = setTimeout(() => { refreshT.delete(db.id); runSync(db); }, 15000); t.unref?.(); refreshT.set(db.id, t);
+        } else st.error = /rate/i.test(String(e.name) + String(e.message))
+          ? 'O Discord está limitando atualizações de comandos. Suas mudanças foram salvas e sincronizam no próximo save.'
+          : discordErr(e).slice(0, 600);
+        console.error(`[sync ${db.name}]`, st.error);
+      }
+    } while (st.again);
+    st.busy = false;
+  })();
+}
+const NETERR = new Set(['EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT']);
+const isNet = e => NETERR.has(e?.code) || NETERR.has(e?.cause?.code) || /EAI_AGAIN|handshake has timed out|ETIMEDOUT|ECONNRESET|fetch failed/i.test(String(e?.message));
+// temporary network failures (DNS not ready, cloud host busy) are retried a few times before giving up
 const dfetch = async (url, opt) => {
-  try { return await fetch(url, { ...opt, signal: AbortSignal.timeout(15000) }); }
-  catch (e) { throw new Error(e.name === 'TimeoutError' || e.name === 'AbortError' ? 'Discord did not answer in time. Try again.' : e.message); }
+  let last;
+  for (let n = 0; n < 4; n++) {
+    try { return await fetch(url, { ...opt, signal: AbortSignal.timeout(15000) }); }
+    catch (e) {
+      last = e;
+      if (!isNet(e) && e.name !== 'TimeoutError' && e.name !== 'AbortError') break;
+      await sleep(600 * (n + 1));
+    }
+  }
+  const t = last && (last.name === 'TimeoutError' || last.name === 'AbortError');
+  throw new Error(t ? 'Discord did not answer in time. Try again.' : /EAI_AGAIN/.test(String(last?.cause?.code || last?.message)) ? 'Could not reach Discord (DNS). The host network is busy, try again in a moment.' : (last?.message || 'Network error'));
 };
+
 async function info(token) {
   const r = await dfetch('https://discord.com/api/v10/users/@me', { headers: { Authorization: 'Bot ' + token } });
   if (!r.ok) throw new Error('Invalid token');

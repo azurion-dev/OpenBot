@@ -102,6 +102,9 @@ details.ovr{border:1px solid var(--ln2);border-radius:8px;padding:6px 8px;margin
 .gh2 button svg,.nh button svg{width:14px;height:14px}.pb svg,.mdh svg{width:14px;height:14px}
 h2 svg,h3 svg{vertical-align:-.15em}.tb button svg{width:13px;height:13px}.sw button svg{width:12px;height:12px}.pk .vi-ic svg{width:16px;height:16px}
 
+body.saving #pg,body.saving aside{opacity:.55;transition:opacity .15s}
+body.saving,body.saving *{cursor:progress!important}
+
 /* ---------- animations ---------- */
 @keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
@@ -249,7 +252,12 @@ let prof={displayName:'',bio:'',avatar:'',theme:'system',customCss:'',cssOn:true
 const L=()=>kind==='ev'?B.events:B.commands;
 const api=async(p,m,b)=>{const c=new AbortController(),t=setTimeout(()=>c.abort(),70000);try{const r=await fetch('/api/'+p,{method:m||'GET',headers:{'content-type':'application/json'},body:b?JSON.stringify(b):undefined,signal:c.signal});const j=await r.json();if(j.error)throw new Error(j.error);return j}catch(e){throw new Error(e.name==='AbortError'?'The server did not answer. Try again in a moment.':e.message)}finally{clearTimeout(t)}};
 const toast=m=>{const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t.h);t.h=setTimeout(()=>t.style.display='none',3500)};
-const go=async f=>{try{return await f()}catch(e){toast(''+e.message)}};
+// every action that talks to the server LOCKS the page (inert = no clicks, no typing, no focus) until it finishes,
+// so you can never edit / save another command while one is still being saved.
+let busyN=0;
+const setBusy=on=>{busyN=Math.max(0,busyN+(on?1:-1));const b=busyN>0;document.body.classList.toggle('saving',b);for(const s of['#pg','aside']){const el=$(s);if(el)el.inert=b}if(b)document.activeElement?.blur?.()};
+const go=async f=>{setBusy(true);try{return await f()}catch(e){toast(''+e.message)}finally{setBusy(false)}};
+const goq=async f=>{try{return await f()}catch(e){toast(''+e.message)}};   // same, but does NOT lock the page (only for loading data)
 function ask(title,cb,init='',file=false){const o=document.createElement('div');o.className='ov';o.style.zIndex=30;o.innerHTML=`<div class="mo" style="width:min(640px,94vw)"><h3 style="margin-top:0">${title}</h3>${file?'<p style="margin:0 0 8px"><button class="pr" id="askf"><i data-lucide="folder-open" class="li"></i> Choose a .json file</button> <span class="mu">or paste the JSON below</span></p><input type="file" id="askfi" accept=".json,application/json" style="display:none">':''}<textarea id="ask" style="min-height:260px;font:12px monospace">${esc(init)}</textarea><p style="display:flex;gap:8px"><button class="pr" id="askok">Import</button><button id="askno">Cancel</button></p></div>`;document.body.appendChild(o);const ok=o.querySelector('#askok'),no=o.querySelector('#askno');no.onclick=()=>o.remove();
  if(file){const fi=o.querySelector('#askfi');o.querySelector('#askf').onclick=()=>fi.click();fi.onchange=()=>{const f=fi.files[0];if(!f)return;if(f.size>5e6)return toast('File too large');const r=new FileReader();r.onload=()=>{$('#ask').value=String(r.result);ok.click()};r.onerror=()=>toast('Could not read the file');r.readAsText(f)}}ok.onclick=()=>{try{cb(JSON.parse($('#ask').value));o.remove()}catch(e){toast(''+e.message)}}}
 
@@ -518,7 +526,7 @@ function rzStart(e,k){
  const up=()=>{removeEventListener('pointermove',mv);removeEventListener('pointerup',up);removeEventListener('pointercancel',up);h.classList.remove('on');document.body.classList.remove('rzing');saveUI()};
  addEventListener('pointermove',mv);addEventListener('pointerup',up);addEventListener('pointercancel',up)}
 const nav=p=>{page=p;if(p==='cmds')kind='cmd';if(p==='evs')kind='ev';shell()};
-setInterval(()=>{if(B)api('bots/'+B.id).then(r=>{B.running=r.running;B.tag=r.tag;if(r.syncError&&r.syncError!==B.syncError)toast(''+r.syncError);B.syncError=r.syncError;B.accounts=r.accounts;const st=r.revC+'.'+r.revE;if((r.revC!==B.revC||r.revE!==B.revE)&&B.stale!==st){B.stale=st;toast('Another account changed this bot. Reload the page to get the latest version (saving now would be refused).')}pill()}).catch(()=>{})},8000);
+setInterval(()=>{if(B&&!busyN&&!document.hidden)api('bots/'+B.id+'/status').then(r=>{B.running=r.running;B.tag=r.tag;if(r.syncError&&r.syncError!==B.syncError)toast(''+r.syncError);B.syncError=r.syncError;B.accounts=r.accounts;const st=r.revC+'.'+r.revE;if((r.revC!==B.revC||r.revE!==B.revE)&&B.stale!==st){B.stale=st;toast('Another account changed this bot. Reload the page to get the latest version (saving now would be refused).')}pill()}).catch(()=>{})},20000);
 function show(){const p=$('#pg');
  if(page==='home')p.innerHTML=`<h2>Welcome, ${esc(prof.displayName||me)} </h2><div class="cards"><div class="card"><div class="ic"><i data-lucide="gavel" class="li"></i></div><h3>Command Builder</h3><p class="mu">Build slash commands visually with connected blocks.</p><p><button class="pr" style="width:100%;justify-content:center" onclick="newCmd()">New command →</button></p><small class="mu">${B.commands.length} command(s)</small></div><div class="card"><div class="ic" style="background:var(--bl)"><i data-lucide="braces" class="li"></i></div><h3>Variables</h3><p class="mu">${VARS.length} variables for your messages.</p><button onclick="nav('vars')">View all →</button></div><div class="card"><div class="ic" style="background:var(--yl)"><i data-lucide="bell" class="li"></i></div><h3>Events</h3><p class="mu">React to joins, leaves, messages, reactions and more.</p><p><button class="pr" style="width:100%;justify-content:center" onclick="nav('evs');pickEvent()">New event →</button></p><small class="mu">${(B.events||[]).length} event(s)</small></div></div>`;
  else if(page==='cmds')p.innerHTML=`<h2>Commands <span style="float:right"><button onclick="importCmd()"><i data-lucide="upload" class="li"></i> Import</button> <button class="pr" onclick="newCmd()"><i data-lucide="plus" class="li"></i> New</button></span></h2>${SB('Search commands...','.cl')}${B.commands.map((x,i)=>`<div class="cl" onclick="openCmd(${i})"><div class="ic">/</div><div style="flex:1"><b>/${esc(x.name)}</b><div class="mu">${esc(x.description)} · ${x.nodes.length} block(s)${x.enabled===false?' · <span style="color:#f87171">disabled</span>':''}</div></div><label class="ck" style="margin:0" onclick="event.stopPropagation()"><input type="checkbox" ${x.enabled!==false?'checked':''} onchange="togCmd(${i},this.checked)">On</label><button onclick="event.stopPropagation();dupCmd(${i})"><i data-lucide="copy" class="li"></i></button><button onclick="event.stopPropagation();exportCmd(${i})"><i data-lucide="download" class="li"></i> Export</button><button class="x" onclick="event.stopPropagation();delCmd(${i})"><i data-lucide="trash" class="li"></i> Delete</button></div>`).join('')||'<p class="mu">No commands yet.</p>'}`;
@@ -586,10 +594,12 @@ const pickBn=inp=>crop(inp,1360,480,d=>{newBn=d;rmBn=false;$('#bnp').style.backg
 const rmAvatar=()=>{newAv=null;rmAv=true;$('#avp').src='https://cdn.discordapp.com/embed/avatars/0.png'};
 const rmBanner=()=>{newBn=null;rmBn=true;$('#bnp').style.backgroundImage='none'};
 const saveProf=()=>go(async()=>{const body={description:$('#pdesc').value},n=$('#bn').value.trim();if(n&&n!==B.name)body.name=n;if(newAv)body.avatar=newAv;if(newBn)body.banner=newBn;if(rmAv)body.removeAvatar=true;if(rmBn)body.removeBanner=true;B={...B,...await api(`bots/${B.id}/profile`,'POST',body)};newAv=newBn=null;rmAv=rmBn=false;toast('Profile updated');shell()});
-const loadAbout=()=>go(async()=>{const r=await api(`bots/${B.id}/about`),e=$('#pdesc');B.banner=r.banner;if(e){e.value=r.description||'';e.placeholder='';if(r.banner&&!rmBn&&!newBn)$('#bnp').style.backgroundImage=`url('${r.banner}')`}});
+const loadAbout=()=>goq(async()=>{const r=await api(`bots/${B.id}/about`),e=$('#pdesc');B.banner=r.banner;if(e){e.value=r.description||'';e.placeholder='';if(r.banner&&!rmBn&&!newBn)$('#bnp').style.backgroundImage=`url('${r.banner}')`}});
 const saveSet=()=>go(async()=>{B={...B,...await api(`bots/${B.id}/settings`,'POST',{token:$('#tk').value,status:$('#st').value,activityType:+$('#at').value,activityText:$('#tx').value,guildId:$('#gd').value.trim(),autoStart:$('#au').checked,intents:Object.fromEntries(Object.keys(INT).map(k=>[k,$('#in_'+k).checked]))})};toast('Saved');shell()});
 const delBot=()=>confirm((B.accounts>1?'This bot is shared with '+(B.accounts-1)+' other account(s). It will only be removed from YOUR account; the workspace and the running bot stay for them. Continue?':'Remove this bot?'))&&go(async()=>{await api('bots/'+B.id,'DELETE');boot()});
-const saveCmds=()=>go(async()=>{const e=kind==='ev',r=await api(`bots/${B.id}/${e?'events':'commands'}`,'POST',e?{events:B.events,rev:B.revE}:{commands:B.commands,rev:B.revC});if(e){B.events=r.events;B.revE=r.revE}else{B.commands=r.commands;B.revC=r.revC}B.stale=0;const s=$('#sv');if(s)s.textContent='✓ Saved';toast('Saved'+(e?'':B.running?' & synced to Discord!':' (start the bot to sync)'))});
+const saveCmds=()=>go(async()=>{const e=kind==='ev',s0=$('#sv');if(s0)s0.textContent='Saving...';toast('Saving...');
+ try{const r=await api(`bots/${B.id}/${e?'events':'commands'}`,'POST',e?{events:B.events,rev:B.revE}:{commands:B.commands,rev:B.revC});if(e){B.events=r.events;B.revE=r.revE}else{B.commands=r.commands;B.revC=r.revC}B.stale=0;const s=$('#sv');if(s)s.textContent='✓ Saved';toast('Saved'+(e?'':B.running?' (syncing to Discord in a few seconds)':' (start the bot to sync)'))}
+ catch(x){const s=$('#sv');if(s)s.textContent='● Unsaved';throw x}});
 const mkCmd=()=>({id:uid(),name:'newcommand',description:'My command',options:[],nodes:[],start:{x:80,y:60,next:null}});
 const delCmd=i=>confirm('Delete '+(kind==='ev'?'':'/')+L()[i].name+'?')&&go(async()=>{L().splice(i,1);cur=null;await saveCmds();page=kind==='ev'?'evs':'cmds';shell()});
 const dupCmd=i=>go(async()=>{const c=JSON.parse(JSON.stringify(L()[i]));c.id=uid();c.name=kind==='ev'?(c.name+' copy').slice(0,60):(c.name+'copy').slice(0,32);L().push(c);await saveCmds();shell()});
@@ -802,7 +812,7 @@ const dirty=()=>{const s=$('#sv');if(s)s.textContent='● Unsaved'};
 const ins=v=>{const e=lastEl;if(!e)return toast('Click a text field first');const s=e.selectionStart??e.value.length;e.value=e.value.slice(0,s)+v+e.value.slice(e.selectionEnd??s);e.focus();e.setSelectionRange(s+v.length,s+v.length);e.dispatchEvent(new Event('input',{bubbles:true}))};
 document.addEventListener('focusin',e=>{if(e.target.closest('.pp,.me')&&!e.target.closest('.vd')&&e.target.matches('textarea,input:not([type=checkbox]):not([type=color])'))lastEl=e.target});
 document.addEventListener('input',e=>{if(e.target.closest('.pp'))dirty()});
-document.addEventListener('keydown',e=>{if(page==='bd'&&!$('#me')&&(e.key==='Delete'||e.key==='Backspace')&&!e.target.matches('input,textarea,select')&&sel!=='start')delNode(sel)});
+document.addEventListener('keydown',e=>{if(page==='bd'&&!busyN&&!$('#me')&&(e.key==='Delete'||e.key==='Backspace')&&!e.target.matches('input,textarea,select')&&sel!=='start')delNode(sel)});
 document.addEventListener('mousedown',e=>{const cv=e.target.closest('#cvs');if(!cv||e.button||e.target.closest('.xc'))return;
  const out=e.target.closest('[data-out]');if(out){const p=wp(e);act={t:'link',from:out.dataset.out,br:out.dataset.br,mx:p.x,my:p.y};e.preventDefault();return}
  const nd=e.target.closest('.gn');if(nd){const id=nd.id.slice(2);if(sel!==id)select(id);if(e.target.closest('[data-drag]')&&!e.target.closest('button')){const n=nodeById(id),p=wp(e);act={t:'drag',n,id,dx:p.x-n.x,dy:p.y-n.y}}return}
@@ -982,7 +992,7 @@ let dbCur='default',dbRows=[];
 const dbScopeLabel=s=>s==='g'?'Whole bot':s.startsWith('s:')?'Server '+s.slice(2):s.startsWith('u:')?'User '+s.slice(2):s.startsWith('m:')?'Server / user '+s.slice(2).replace(':',' / '):s;
 const dbShow=v=>{const t=typeof v==='object'?JSON.stringify(v):String(v);return t.length>140?t.slice(0,140)+'…':t};
 const dbScope=()=>{const k=$('#dsk').value,ids=$('#dsi').value.trim().split(/[\s,\/]+/).filter(Boolean);if(k==='g')return 'g';if(k==='m'){if(ids.length<2)throw new Error('Type the server ID and the user ID');return `m:${ids[0]}:${ids[1]}`}if(!ids[0])throw new Error('Type the ID');return `${k}:${ids[0]}`};
-const drawDbs=()=>go(async()=>{
+const drawDbs=()=>goq(async()=>{
  const list=await api(`bots/${B.id}/databases`);B.databases=list.map(d=>d.name);if(!B.databases.includes(dbCur))dbCur='default';
  const t=await api(`bots/${B.id}/databases/${encodeURIComponent(dbCur)}`);dbRows=t.entries;
  $('#pg').innerHTML=`<h2><i data-lucide="database" class="li"></i> Databases</h2><p class="mu">Each bot can have several databases. Use them with the <b>Saved Data</b> block (pick one there, or set a default for each command / event). Stored in <code>data/users/${esc(me)}/bots/${esc(B.id)}/databases/</code>.</p>

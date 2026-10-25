@@ -68,22 +68,37 @@ for (const u of Object.values(db.users)) for (const b of u.bots || []) {
   b.reacts = b.reacts || {};
   b.dbs = fixDbs(b.dbs); delete b.store;
 }
-// saving never throws and never gives up: if something fails (file locked, disk busy...) it tries again every few seconds until it works
-let saveRetry = null, saving = false;
+
+// ---------- SAVING ----------
+// save() only SCHEDULES a write (400 ms later, many calls in a row become ONE write). The write itself is asynchronous and writes
+// one file at a time, so the server, the Discord connection and DNS never freeze while saving (this was what crashed the cloud host).
+// If something fails (disk busy...) it tries again every few seconds until it works. Changes always stay in memory meanwhile.
+let saveTimer = null, saving = false, again = false, saveRetry = null;
 const save = () => {
-  if (saving) return;                                   // never run two saves at once
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => { saveTimer = null; flush(); }, 400);
+  saveTimer.unref?.();
+};
+async function flush() {
+  if (saving) { again = true; return; }                  // never run two saves at once
   saving = true;
   let r;
-  try { r = storage.save(db); } catch (e) { console.error('Could not save data:', e.message); r = { ok: false }; }
+  try { r = await storage.saveAsync(db); } catch (e) { console.error('Could not save data:', e.message); r = { ok: false }; }
   saving = false;
   if (r && r.ok === false) {
-    if (!saveRetry) { console.error('⚠️ Saving failed, trying again in 5s (your changes are still in memory).'); saveRetry = setTimeout(() => { saveRetry = null; save(); }, 5000); saveRetry.unref?.(); }
+    if (!saveRetry) { console.error('⚠️ Saving failed, trying again in 5s (your changes are still in memory).'); saveRetry = setTimeout(() => { saveRetry = null; flush(); }, 5000); saveRetry.unref?.(); }
   } else if (saveRetry) { clearTimeout(saveRetry); saveRetry = null; console.log('✅ Saving works again.'); }
+  if (again) { again = false; save(); }
+}
+// synchronous version: ONLY when the program is closing (nothing else matters at that point)
+const saveNow = () => {
+  clearTimeout(saveTimer); saveTimer = null;
+  try { return storage.save(db); } catch (e) { console.error('Could not save data:', e.message); return { ok: false }; }
 };
-setInterval(save, 60000).unref();                       // safety net: write everything once a minute
+setInterval(save, 60000).unref();                       // safety net: write everything once a minute (only changed files are really written)
 // sessions are stored as sha256(sid) -> { u, exp }. Old-format / expired sessions are dropped (those users just sign in again)
 for (const [k, v] of Object.entries(db.sessions)) if (!v || typeof v !== 'object' || !(v.exp > Date.now())) delete db.sessions[k];
-if (loaded.migrated) { save(); storage.finishMigration(); }
+if (loaded.migrated) { const r = saveNow(); if (r.ok) storage.finishMigration(); }
 const uid = () => crypto.randomBytes(6).toString('hex');
 // command / event ids become file names, so keep them safe and unique
 const fixIds = list => { const used = new Set(); return list.map(c => { let id = String(c.id || '').replace(/[^\w-]/g, '').slice(0, 40); if (!id || used.has(id)) id = uid(); used.add(id); return { ...c, id }; }); };
@@ -302,6 +317,8 @@ app.post('/api/bots', auth, wrap(async q => {
   q.user.bots.push(b); save(); return sum(b);
 }));
 app.get('/api/bots/:id', auth, wrap(q => full(get(q))));
+// tiny endpoint for the dashboard's periodic check (instead of sending ALL commands every few seconds)
+app.get('/api/bots/:id/status', auth, wrap(q => { const b = get(q); return { ...sum(b), revC: revOf(b, 'C'), revE: revOf(b, 'E') }; }));
 app.post('/api/bots/:id/settings', auth, wrap(async q => {
   const b = get(q), s = q.body && typeof q.body === 'object' ? q.body : {}, old = b.settings, before = JSON.stringify(old.intents || {});
   if (s.token !== undefined && s.token !== '') {
@@ -329,7 +346,8 @@ app.post('/api/bots/:id/settings', auth, wrap(async q => {
 }));
 app.get('/api/bots/:id/about', auth, wrap(async q => {
   const b = get(q), t = b.settings.token, i = await bot.info(t);
-  Object.assign(b, { name: i.name, avatar: i.avatar, banner: i.banner }); save();
+  const changed = b.name !== i.name || b.avatar !== i.avatar || (b.banner || '') !== (i.banner || '');
+  Object.assign(b, { name: i.name, avatar: i.avatar, banner: i.banner }); if (changed) save();
   return { description: await bot.about(t), banner: i.banner, avatar: i.avatar };
 }));
 app.post('/api/bots/:id/profile', auth, wrap(async q => {
@@ -343,11 +361,13 @@ app.post('/api/bots/:id/profile', auth, wrap(async q => {
   const i = await bot.info(b.settings.token); Object.assign(b, { botId: i.id, name: i.name, avatar: i.avatar, banner: i.banner });
   save(); return full(b);
 }));
+// NOTE: these handlers are synchronous from "check the revision" to "store the new list" (no await in between), so two requests
+// can never mix. The slow part (telling Discord) is debounced inside bot.refresh(), so saving fast many times = ONE sync to Discord.
 app.post('/api/bots/:id/commands', auth, wrap(async q => {
   const b = get(q); checkRev(q, b, 'C');
   b.commands = fixIds((q.body.commands || []).map(conv).map(c => acc({ ...c, name: String(c.name || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32) })).filter(c => c.name));
   b.revC = revOf(b, 'C') + 1;
-  save(); await bot.refresh(b); return full(b);
+  save(); bot.refresh(b); return full(b);
 }));
 app.post('/api/bots/:id/events', auth, wrap(async q => {
   const b = get(q), s = v => String(v || '').slice(0, 200); checkRev(q, b, 'E');
@@ -360,7 +380,7 @@ app.post('/api/bots/:id/events', auth, wrap(async q => {
 app.post('/api/bots/:id/modules', auth, wrap(async q => {
   const b = get(q);
   b.modules = deep(MOD_DEF(), q.body.modules);
-  save(); await bot.refresh(b); return full(b);
+  save(); bot.refresh(b); return full(b);
 }));
 // force a new registration of the slash commands (even if nothing changed)
 app.post('/api/bots/:id/resync', auth, wrap(async q => {
@@ -425,11 +445,17 @@ bot.setSaver(save);
 process.on('unhandledRejection', e => console.error('[unhandled rejection]', e?.message || e));
 process.on('uncaughtException', e => console.error('[uncaught exception]', e?.stack || e));
 const port = process.env.PORT || 17751, host = process.env.HOST || '0.0.0.0';      // 0.0.0.0 = reachable from the network too (use HTTPS / a firewall if it is exposed to the internet)
+// starts a bot; if Discord / DNS is not reachable yet (common right after a cloud host boots) it tries again a few times
+const autoStart = (b, n = 0) => bot.start(b).catch(e => {
+  console.log(b.name, 'failed to start:', e.message);
+  if (n < 4 && !/token|intent/i.test(e.message)) setTimeout(() => autoStart(b, n + 1), 15000 * (n + 1)).unref?.();
+});
 const srv = app.listen(port, host, () => {
   const lan = Object.values(require('os').networkInterfaces()).flat().filter(a => a && a.family === 'IPv4' && !a.internal).map(a => a.address);
   console.log(`OpenBot is listening on ${host}:${port}` + (host === '0.0.0.0' && lan.length ? '  →  ' + lan.map(a => `http://${a}:${port}`).join('  ') : ''));
   const started = new Set();
-  for (const b of allBots()) if (b.settings.token && b.settings.autoStart && !started.has(b.id) && started.add(b.id)) bot.start(b).catch(e => console.log(b.name, 'failed to start:', e.message));
+  let wait = 0;                                   // bots start 3 s apart (all at once = a burst of connections the host may not like)
+  for (const b of allBots()) if (b.settings.token && b.settings.autoStart && !started.has(b.id) && started.add(b.id)) { setTimeout(() => autoStart(b), wait); wait += 3000; }
   const seenBot = new Map();                      // old separate copies of the same bot (before sharing existed): warn, never merge automatically
   for (const [n, u] of Object.entries(db.users)) for (const b of u.bots || []) {
     if (seenBot.has(b.botId) && seenBot.get(b.botId) !== b) console.warn(`⚠️ "${b.name}" exists as a separate copy in the account "${n}". Export its commands, remove it and add the token again to join the shared workspace.`);
@@ -438,5 +464,6 @@ const srv = app.listen(port, host, () => {
 });
 srv.on('error', e => { console.error(e.code === 'EADDRINUSE' ? `Port ${port} is already in use (is another copy still running?)` : e.message); process.exit(1); });
 srv.requestTimeout = 90000; srv.headersTimeout = 20000;
-// save everything when the program is closed (Ctrl+C / stop), so the last changes are never lost
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { save(); process.exit(0); });
+srv.keepAliveTimeout = 65000;                     // longer than the usual reverse proxy timeout (60 s) so the panel proxy never hits a closed socket
+// save everything when the program is closed (Ctrl+C / stop), so the last changes are never lost (sync: nothing else matters now)
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { saveNow(); process.exit(0); });
