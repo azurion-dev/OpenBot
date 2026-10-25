@@ -54,7 +54,17 @@ const sealSettings = st => st && typeof st === 'object' ? { ...st, token: seal(s
 
 const seen = new Map();                      // file -> last content written/read (so only changed files are rewritten)
 
-const rd = (f, d) => { try { const t = fs.readFileSync(f, 'utf8'), j = JSON.parse(t); seen.set(f, t); return j; } catch { return d; } };
+// reads a JSON file. If it is corrupt we try the .bak copy; the broken file is renamed (never silently treated as empty and then overwritten)
+const rd = (f, d) => {
+  for (const g of [f, f + '.bak']) {
+    try { const t = fs.readFileSync(g, 'utf8'), j = JSON.parse(t); seen.set(f, g === f ? t : ''); return j; }
+    catch (e) {
+      if (e.code === 'ENOENT') continue;
+      if (g === f) { console.error('⚠️ Corrupt file, trying the backup:', f, e.message); try { fs.renameSync(f, f + '.corrupt-' + Date.now()); } catch {} }
+    }
+  }
+  return d;
+};
 const dirs = d => { try { return fs.readdirSync(d, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name); } catch { return []; } };
 const jsons = d => { try { return fs.readdirSync(d).filter(f => f.endsWith('.json')); } catch { return []; } };
 const byOrder = (list, order, key) => {
@@ -170,19 +180,37 @@ function load() {
 }
 
 // ---------- save ----------
+const sleepSync = ms => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {} };
+// returns true when the file is really on disk
 function write(f, t) {
-  try {
-    fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
-    const tmp = f + '.tmp'; fs.writeFileSync(tmp, t, { mode: 0o600 }); fs.renameSync(tmp, f); seen.set(f, t);
-  } catch (e) { console.error('Could not write', f, e.message); }
+  let last;
+  try { fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 }); } catch (e) { last = e; }
+  const tmp = f + '.' + process.pid + '.tmp';
+  for (let n = 0; n < 5; n++) {
+    try {
+      fs.writeFileSync(tmp, t, { mode: 0o600 });
+      try { if (seen.get(f)) fs.copyFileSync(f, f + '.bak'); } catch {}      // previous good version
+      fs.renameSync(tmp, f); seen.set(f, t); return true;
+    } catch (e) {
+      last = e;
+      if (!['EPERM', 'EBUSY', 'EACCES', 'EMFILE', 'ENFILE'].includes(e.code)) break;
+      sleepSync(30 * (n + 1));                                         // file briefly locked: wait and retry
+    }
+  }
+  try { fs.unlinkSync(tmp); } catch {}
+  try { fs.writeFileSync(f, t, { mode: 0o600 }); seen.set(f, t); return true; } catch (e) { last = e; }   // last resort: write in place
+  console.error('Could not write', f, last && last.message);
+  return false;
 }
 function remove(f) {
   try { fs.unlinkSync(f); } catch {}
   seen.delete(f);
   for (let d = path.dirname(f); d.startsWith(USERS) && d !== USERS; d = path.dirname(d)) { try { fs.rmdirSync(d); } catch { break; } }
 }
+let lastErrors = 0;
 function save(db) {
-  const out = new Map(), put = (f, v) => out.set(f, JSON.stringify(v, null, 2));
+  const out = new Map(), put = (f, v) => { try { out.set(f, JSON.stringify(v, null, 2)); } catch (e) { lastErrors++; console.error('Could not serialize', f, e.message); } };
+  lastErrors = 0;
   put(SESS, db.sessions || {});
   // every bot must have exactly one owner that really has it in its list (otherwise the first account that has it takes it)
   for (const [u, user] of Object.entries(db.users || {})) for (const b of user.bots || []) {
@@ -196,18 +224,25 @@ function save(db) {
     put(path.join(ub, 'user.json'), { ...rest, botOrder: bots.map(b => b.id), botLinks: links });
     for (const b of bots) {
       if (!ok(b.id) || b.owner !== u) continue;                 // shared bots are written once, in the owner's folder
-      const base = path.join(ub, 'bots', b.id), { commands = [], events = [], modules, warnings, reacts, dbs = {}, owner, ...meta } = b;
-      put(path.join(base, 'bot.json'), { ...meta, settings: sealSettings(meta.settings), commandOrder: commands.map(c => c.id), eventOrder: events.map(c => c.id) });
-      put(path.join(base, 'modules.json'), modules || {});
-      put(path.join(base, 'warnings.json'), warnings || {});
-      put(path.join(base, 'reacts.json'), reacts || {});
-      for (const c of commands) if (ok(c.id)) put(path.join(base, 'commands', c.id + '.json'), c);
-      for (const c of events) if (ok(c.id)) put(path.join(base, 'events', c.id + '.json'), c);
-      for (const [n, t] of Object.entries(dbs)) if (ok(n)) put(path.join(base, 'databases', n + '.json'), { name: n, entries: t.entries || {} });
+      try {                                                      // one broken bot can never stop the others from being saved
+        const base = path.join(ub, 'bots', b.id), { commands = [], events = [], modules, warnings, reacts, dbs = {}, owner, ...meta } = b;
+        put(path.join(base, 'bot.json'), { ...meta, settings: sealSettings(meta.settings), commandOrder: commands.map(c => c.id), eventOrder: events.map(c => c.id) });
+        put(path.join(base, 'modules.json'), modules || {});
+        put(path.join(base, 'warnings.json'), warnings || {});
+        put(path.join(base, 'reacts.json'), reacts || {});
+        for (const c of commands) if (ok(c.id)) put(path.join(base, 'commands', c.id + '.json'), c);
+        for (const c of events) if (ok(c.id)) put(path.join(base, 'events', c.id + '.json'), c);
+        for (const [n, t] of Object.entries(dbs)) if (ok(n)) put(path.join(base, 'databases', n + '.json'), { name: n, entries: t.entries || {} });
+      } catch (e) { lastErrors++; console.error('Could not prepare bot', b && b.id, e.message); }
     }
   }
-  for (const [f, t] of out) if (seen.get(f) !== t) write(f, t);
-  for (const f of [...seen.keys()]) if (!out.has(f)) remove(f);
+  let failed = lastErrors;
+  for (const [f, t] of out) if (seen.get(f) !== t && !write(f, t)) failed++;
+  // deleting files: only when everything above went fine, and never "wipe everything" because the memory looks empty
+  const known = [...seen.keys()].filter(f => f.startsWith(USERS)), gone = known.filter(f => !out.has(f));
+  if (failed === 0 && !(known.length > 3 && gone.length === known.length)) for (const f of gone) remove(f);
+  else if (gone.length) console.warn('Skipped deleting', gone.length, 'file(s) for safety (save had errors or everything looked empty).');
+  return { ok: failed === 0, failed };
 }
 
 // call after the first save of migrated data: leaves a marker and keeps the old file as a backup

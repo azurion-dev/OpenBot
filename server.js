@@ -68,7 +68,19 @@ for (const u of Object.values(db.users)) for (const b of u.bots || []) {
   b.reacts = b.reacts || {};
   b.dbs = fixDbs(b.dbs); delete b.store;
 }
-const save = () => { try { storage.save(db); } catch (e) { console.error('Could not save data:', e.message); } };
+// saving never throws and never gives up: if something fails (file locked, disk busy...) it tries again every few seconds until it works
+let saveRetry = null, saving = false;
+const save = () => {
+  if (saving) return;                                   // never run two saves at once
+  saving = true;
+  let r;
+  try { r = storage.save(db); } catch (e) { console.error('Could not save data:', e.message); r = { ok: false }; }
+  saving = false;
+  if (r && r.ok === false) {
+    if (!saveRetry) { console.error('⚠️ Saving failed, trying again in 5s (your changes are still in memory).'); saveRetry = setTimeout(() => { saveRetry = null; save(); }, 5000); saveRetry.unref?.(); }
+  } else if (saveRetry) { clearTimeout(saveRetry); saveRetry = null; console.log('✅ Saving works again.'); }
+};
+setInterval(save, 60000).unref();                       // safety net: write everything once a minute
 // sessions are stored as sha256(sid) -> { u, exp }. Old-format / expired sessions are dropped (those users just sign in again)
 for (const [k, v] of Object.entries(db.sessions)) if (!v || typeof v !== 'object' || !(v.exp > Date.now())) delete db.sessions[k];
 if (loaded.migrated) { save(); storage.finishMigration(); }
@@ -412,9 +424,10 @@ bot.setSaver(save);
 // a stray error inside a Discord event must never take the whole dashboard down
 process.on('unhandledRejection', e => console.error('[unhandled rejection]', e?.message || e));
 process.on('uncaughtException', e => console.error('[uncaught exception]', e?.stack || e));
-const port = process.env.PORT || 17751, host = process.env.HOST || '0.0.0.0';      // only this computer; set HOST=0.0.0.0 (behind HTTPS!) to open it to the network
+const port = process.env.PORT || 17751, host = process.env.HOST || '0.0.0.0';      // 0.0.0.0 = reachable from the network too (use HTTPS / a firewall if it is exposed to the internet)
 const srv = app.listen(port, host, () => {
-  console.log(`OpenBot is running at → http://${host}:${port}`);
+  const lan = Object.values(require('os').networkInterfaces()).flat().filter(a => a && a.family === 'IPv4' && !a.internal).map(a => a.address);
+  console.log(`OpenBot is listening on ${host}:${port}` + (host === '0.0.0.0' && lan.length ? '  →  ' + lan.map(a => `http://${a}:${port}`).join('  ') : ''));
   const started = new Set();
   for (const b of allBots()) if (b.settings.token && b.settings.autoStart && !started.has(b.id) && started.add(b.id)) bot.start(b).catch(e => console.log(b.name, 'failed to start:', e.message));
   const seenBot = new Map();                      // old separate copies of the same bot (before sharing existed): warn, never merge automatically

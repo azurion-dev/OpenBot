@@ -964,6 +964,26 @@ const exec = {
   }
 };
 
+// Blocks that depend on the bot's (or the user's) Discord permissions. If one of them fails, the flow stops and a message is sent:
+// the text written in the block ("Message if it fails", {error} = the reason) or an automatic one.
+const PERM_NODES = new Set(['kick', 'ban', 'unban', 'timeout', 'untimeout', 'role_add', 'role_remove', 'role_create', 'role_edit', 'role_delete', 'nickname', 'voice',
+  'purge', 'channel_create', 'channel_edit', 'channel_delete', 'channel_perms', 'server_edit', 'emoji_create', 'invite_create']);
+const friendlyError = e => {
+  const code = e && e.code, m = String((e && e.message) || '');
+  if (code === 50013 || /Missing Permissions/i.test(m)) return "I don't have permission to do that. Give my role the needed permission and put my role above the target's role.";
+  if (code === 50001 || /Missing Access/i.test(m)) return "I can't access that (missing access to the channel or server).";
+  if (code === 10007 || code === 10013 || /Unknown (Member|User)/i.test(m)) return "I couldn't find that member.";
+  if (code === 10011 || /Unknown Role/i.test(m)) return "I couldn't find that role.";
+  if (code === 10003 || /Unknown Channel/i.test(m)) return "I couldn't find that channel.";
+  return m || 'Something went wrong.';
+};
+function permError(i, n, e) {
+  const raw = friendlyError(e), custom = String((n.data || {}).errMsg || '').trim();
+  const err = new Error(custom ? custom.split('{error}').map(p => fill(p, i)).join(raw).slice(0, 2000) : raw);
+  err.custom = !!custom; err.cause = e;
+  return err;
+}
+
 // Walks the blocks. Returns 'stop' (end everything), 'break' (leave the loop) or 'skip' (next loop run).
 async function walk(i, c, from) {
   const nodes = new Map((c.nodes || []).map(n => [n.id, n]));
@@ -986,7 +1006,9 @@ async function walk(i, c, from) {
       if (out) return out;
       cur = n.else; continue;
     }
-    const r = await exec[n.type]?.(i, n.data || {}, c, n);
+    let r;
+    try { r = await exec[n.type]?.(i, n.data || {}, c, n); }
+    catch (e) { throw PERM_NODES.has(n.type) ? permError(i, n, e) : e; }      // blocks that need Discord permissions: friendly / custom message
     if (r === 'stop' || r === 'break' || r === 'skip') return r;
     cur = r === 'else' ? n.else : n.next;
   }
@@ -998,8 +1020,8 @@ async function runGraph(i, c, from) {
     const r = await walk(i, c, from);
     if (r === 'stop' || r === 'break') return;
   } catch (e) {
-    console.error(i.ev ? `[event "${c.name}"]` : `[command /${c.name}]`, e.message);
-    if (!i.ev) await send(i, { content: '❌ ' + e.message, ephemeral: true }).catch(() => {});
+    console.error(i.ev ? `[event "${c.name}"]` : `[command /${c.name}]`, e.cause?.message || e.message);
+    if (!i.ev || e.custom) await send(i, { content: e.custom ? e.message : '❌ ' + e.message, ephemeral: true }).catch(() => {});
     return;
   }
   if (!i.ev && !i.replied && !i.deferred) await i.reply({ content: '✅ Done!', ephemeral: true }).catch(() => {});

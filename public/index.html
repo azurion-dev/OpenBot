@@ -163,6 +163,29 @@ details.vd[open] .vls{animation:fadeUp .25s both}details.ovr[open]>.ovg,details.
 .sw button:hover{transform:scale(1.2)}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
 </style>
+<style id="layout">
+.body{grid-template-columns:var(--navw,240px) minmax(0,1fr);position:relative}
+.bd{grid-template-columns:var(--lpw,290px) minmax(0,1fr) var(--rpw,320px);position:relative}
+.bd.rp-off .pp{display:none}
+aside{overflow-x:hidden}
+.rz{position:absolute;top:0;bottom:0;width:8px;margin-left:-4px;cursor:col-resize;z-index:6;touch-action:none}
+.rz:hover,.rz.on{background:linear-gradient(90deg,transparent 3px,var(--bl) 3px,var(--bl) 5px,transparent 5px)}
+.rz[data-k=nav]{left:var(--navw,240px)}
+.rz[data-k=lp]{left:var(--lpw,290px)}
+.rz[data-k=rp]{right:var(--rpw,320px);margin-left:0;margin-right:-4px}
+.rzb{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:18px;height:46px;padding:0;justify-content:center;border-radius:9px;opacity:0;cursor:pointer}
+.rzb svg{width:14px;height:14px}
+.rz:hover .rzb,.bd.rp-off .rz[data-k=rp] .rzb{opacity:1}
+.bd.rp-off .rz[data-k=rp]{right:0;margin:0;width:22px;background:none}
+body.rzing,body.rzing *{cursor:col-resize!important;user-select:none!important}
+.navtg{display:flex;justify-content:flex-end;margin:-4px 0 8px}.navtg button{padding:4px 7px}.navtg svg{width:16px;height:16px}
+.body.mini aside{padding:14px 8px}
+.body.mini .navtg{justify-content:center}
+.body.mini .bc{justify-content:center;padding:6px}.body.mini .bc>div{display:none}.body.mini .bc img{cursor:pointer}
+.body.mini .nv{justify-content:center;padding:10px 0}.body.mini .nv span{display:none}.body.mini .nv:hover{transform:none}
+@media(max-width:1000px){.bd{grid-template-columns:minmax(0,1fr)}.bd .rz{display:none}.bd.rp-off .pp{display:block}}
+@media(max-width:800px){.body{grid-template-columns:minmax(0,1fr)}.rz[data-k=nav]{display:none}}
+</style>
 <script>
 const OB={mq:matchMedia('(prefers-color-scheme: light)'),
  apply(t,css,on){t=['dark','light'].includes(t)?t:'system';OB.t=t;OB.css=css||'';OB.on=on!==false;
@@ -284,6 +307,9 @@ const SCHEMA={
  cond_voice:{n:'mic Voice Condition',t:C,c:'CONDITIONS',d:'Run actions based on the voice state of a member',f:[TGT,['mode','select','Check',['is in a voice channel','is in this voice channel (ID)','is server muted','is server deafened','is streaming']],['channel','text','Voice channel ID (for "is in this voice channel")'],OTH]},
  data:{n:'save Saved Data',t:A,c:'UTILITY',d:'Saves and reads values in a database: counters, points, flags, text, lists. Survives restarts (see the Databases page)',f:[['op','select','Operation',['get','set','add','subtract','toggle','push','push unique','remove item','delete','exists','keys']],['db','dbpick','Database'],['key','text','Key (e.g. points) — not needed for "keys"'],['type','select','Type (used by set; auto = detect)',['auto','string','number','boolean','list','json']],['value','textarea','Value (set / add / subtract / push / remove item). Lists: one item per line'],['scope','select','Stored for',['whole bot','each server','each user','each user per server']],['saveAs','text','Save the result as variable — use {var.name} (default: data)']]}
 };
+// blocks that depend on Discord permissions get an optional "if it fails" message (the bot stops the flow and sends it)
+const ERRF=['errMsg','textarea','Message if it fails (empty = automatic message). {error} = the reason. Example: ❌ I could not do that: {error}'];
+['kick','ban','unban','timeout','untimeout','role_add','role_remove','role_create','role_edit','role_delete','nickname','voice','purge','channel_create','channel_edit','channel_delete','channel_perms','server_edit','emoji_create','invite_create'].forEach(k=>{if(SCHEMA[k]&&!SCHEMA[k].f.some(f=>f[0]==='errMsg'))SCHEMA[k].f.push(ERRF)});
 const OT=['string','integer','number','boolean','user','channel','role','mentionable','attachment'];
 const VG=[['User',[['{user}','User mention'],['{user.name}','Username'],['{user.tag}','User tag'],['{user.id}','User ID'],['{user.avatar}','Avatar URL'],['{user.created}','Account age']]],['Server',[['{server}','Server name'],['{server.id}','Server ID'],['{server.members}','Member count'],['{server.icon}','Server icon URL'],['{channel}','Current channel']]],['Bot & time',[['{bot.name}','Bot name'],['{date}','Date'],['{time}','Time'],['{random}','Random 1-100']]],['Interactions',[['{clicker}','Who pressed the button / used the menu / sent the form (mention)'],['{clicker.name}','Name of who pressed'],['{clicker.id}','ID of who pressed'],['{clicker.tag}','Tag of who pressed'],['{clicker.avatar}','Avatar of who pressed'],['{clicker.nickname}','Server nickname of who pressed'],['{starter}','Who ran the command / pressed the button that created this message (e.g. the ticket owner)'],['{starter.name}','Name of the starter'],['{starter.id}','ID of the starter'],['{starter.tag}','Tag of the starter'],['{starter.avatar}','Avatar of the starter'],['{selected}','Dropdown selection'],['{pressed}','Label of the button/option pressed'],['{pressed.id}','ID of the button/option pressed']]],['Loop',[['{loop.index}','Current run number (1, 2, 3...)'],['{loop.item}','Current line (Loop → each line)'],['{loop.count}','Total runs']]]];
 const VARS=VG.flatMap(g=>g[1]).concat([['{opt.name}','Command option value'],['{var.name}','Saved variable'],['{var.api.data.x}','API response field'],['{field.id}','Modal field answer']]);
@@ -404,10 +430,30 @@ const pick=(id,keep)=>go(async()=>{B=await api('bots/'+id);localStorage.setItem(
 // ---------- shell + pages ----------
 const inv=()=>`https://discord.com/oauth2/authorize?client_id=${B.botId}&scope=bot%20applications.commands&permissions=8`;
 function shell(){sync();$('#root').innerHTML=`<div class="top"><span class="logo"><img src="/assets/logo.png" alt="" onerror="this.style.display='none'">OpenBot</span><span class="pill"><i class="dot" id="dot"></i><span id="tag">Offline</span></span><button id="tg" class="gr" onclick="toggle()"><i data-lucide="play" class="li"></i> Start</button><a class="btn bl" href="${inv()}" target="_blank"><i data-lucide="link" class="li"></i> Invite</a><button onclick="nav('acc')" title="Account">${avt(24)} ${esc(prof.displayName||me)}</button><button onclick="logout()">${I('log-out')} Sign out</button></div>
-<div class="body"><aside><div class="bc"><img src="${esc(B.avatar)}"><div style="flex:1"><b>${esc(B.name)}</b>${B.accounts>1?`<div class="mu" style="font-size:11px" title="Everyone who adds this bot with the same token edits the same commands, events and databases"><i data-lucide="users" class="li"></i> Shared workspace · ${B.accounts} accounts</div>`:''}<select onchange="this.value==='+'?gate(true):pick(this.value)">${bots.map(b=>`<option value="${b.id}" ${b.id===B.id?'selected':''}>${esc(b.name)}</option>`).join('')}<option value="+">+ Add bot</option></select></div></div>
-${[['home','package Home'],['cmds','zap Commands'],['evs','bell Events'],['dbs','database Databases'],['vars','braces Variables'],['set','settings Settings'],['acc','user Account']].map(([k,l])=>`<div class="nv ${page===k||(page==='bd'&&((k==='cmds'&&kind==='cmd')||(k==='evs'&&kind==='ev')))?'on':''}" onclick="nav('${k}')">${I(ico(l))}<span>${esc(nm(l))}</span></div>`).join('')}</aside><div id="pg"></div></div>`;pill();show()}
+<div class="body ${UI.nav<=100?'mini':''}"><div class="rz" data-k="nav" onpointerdown="rzStart(event,'nav')"></div><aside><div class="navtg"><button id="navtg" data-m="${UI.nav<=100}" onclick="togNav()" title="Collapse / expand the menu">${I(UI.nav<=100?'chevrons-right':'chevrons-left')}</button></div><div class="bc"><img src="${esc(B.avatar)}" title="${esc(B.name)}" onclick="UI.nav<=100&&togNav()"><div style="flex:1"><b>${esc(B.name)}</b>${B.accounts>1?`<div class="mu" style="font-size:11px" title="Everyone who adds this bot with the same token edits the same commands, events and databases"><i data-lucide="users" class="li"></i> Shared workspace · ${B.accounts} accounts</div>`:''}<select onchange="this.value==='+'?gate(true):pick(this.value)">${bots.map(b=>`<option value="${b.id}" ${b.id===B.id?'selected':''}>${esc(b.name)}</option>`).join('')}<option value="+">+ Add bot</option></select></div></div>
+${[['home','package Home'],['cmds','zap Commands'],['evs','bell Events'],['dbs','database Databases'],['vars','braces Variables'],['set','settings Settings'],['acc','user Account']].map(([k,l])=>`<div class="nv ${page===k||(page==='bd'&&((k==='cmds'&&kind==='cmd')||(k==='evs'&&kind==='ev')))?'on':''}" title="${esc(nm(l))}" onclick="nav('${k}')">${I(ico(l))}<span>${esc(nm(l))}</span></div>`).join('')}</aside><div id="pg"></div></div>`;applyUI();pill();show()}
 function pill(){$('#dot')?.classList.toggle('on',!!B.running);if($('#tag'))$('#tag').textContent=B.running?B.tag:'Offline';if($('#tg')){$('#tg').innerHTML=B.running?I('square')+' Stop':I('play')+' Start';$('#tg').className=B.running?'x':'gr'}}
 const toggle=()=>go(async()=>{toast(B.running?'Stopping...':'Starting...');const r=await api(`bots/${B.id}/${B.running?'stop':'start'}`,'POST',{});B.running=r.running;B.tag=r.tag;pill();toast(r.running?'Bot is online!':'Bot stopped')});
+// ---------- layout: panel sizes are remembered; the right panel can be closed; the side menu can shrink to icons only ----------
+const UI=(()=>{let u={};try{u=JSON.parse(localStorage.getItem('ob_layout')||'{}')}catch{}return{nav:+u.nav||240,lp:+u.lp||290,rp:+u.rp||320,rpOpen:u.rpOpen!==false}})();
+const clampN=(v,a,b)=>Math.min(Math.max(v,a),b),saveUI=()=>{try{localStorage.setItem('ob_layout',JSON.stringify(UI))}catch{}};
+function applyUI(){const r=document.documentElement.style,mini=UI.nav<=100;
+ r.setProperty('--navw',UI.nav+'px');r.setProperty('--lpw',UI.lp+'px');r.setProperty('--rpw',(UI.rpOpen?UI.rp:0)+'px');
+ document.querySelector('.body')?.classList.toggle('mini',mini);document.querySelector('.bd')?.classList.toggle('rp-off',!UI.rpOpen);
+ const t=document.getElementById('navtg');if(t&&t.dataset.m!==String(mini)){t.dataset.m=String(mini);t.innerHTML=I(mini?'chevrons-right':'chevrons-left')}
+ const b=document.querySelector('.rz[data-k=rp] .rzb');if(b&&b.dataset.o!==String(UI.rpOpen)){b.dataset.o=String(UI.rpOpen);b.innerHTML=I(UI.rpOpen?'chevron-right':'chevron-left')}}
+const togNav=()=>{UI.nav=UI.nav<=100?240:68;saveUI();applyUI()};
+const togRP=()=>{UI.rpOpen=!UI.rpOpen;saveUI();applyUI()};
+function rzStart(e,k){
+ if(e.target.closest&&e.target.closest('.rzb'))return;e.preventDefault();
+ const h=e.currentTarget,host=h.parentElement.getBoundingClientRect();h.classList.add('on');document.body.classList.add('rzing');
+ const mv=ev=>{const x=ev.clientX;
+  if(k==='nav'){const w=clampN(x-host.left,60,420);UI.nav=w<120?68:Math.max(w,170)}
+  else if(k==='lp')UI.lp=clampN(x-host.left,200,620);
+  else{UI.rpOpen=true;UI.rp=clampN(host.right-x,240,720)}
+  applyUI()};
+ const up=()=>{removeEventListener('pointermove',mv);removeEventListener('pointerup',up);removeEventListener('pointercancel',up);h.classList.remove('on');document.body.classList.remove('rzing');saveUI()};
+ addEventListener('pointermove',mv);addEventListener('pointerup',up);addEventListener('pointercancel',up)}
 const nav=p=>{page=p;if(p==='cmds')kind='cmd';if(p==='evs')kind='ev';shell()};
 setInterval(()=>{if(B)api('bots/'+B.id).then(r=>{B.running=r.running;B.tag=r.tag;if(r.syncError&&r.syncError!==B.syncError)toast(''+r.syncError);B.syncError=r.syncError;B.accounts=r.accounts;const st=r.revC+'.'+r.revE;if((r.revC!==B.revC||r.revE!==B.revE)&&B.stale!==st){B.stale=st;toast('Another account changed this bot. Reload the page to get the latest version (saving now would be refused).')}pill()}).catch(()=>{})},8000);
 function show(){const p=$('#pg');
@@ -493,9 +539,9 @@ const cmd=()=>L()[cur],nid=n=>n===cmd().start?'start':n.id;
 const nodeById=id=>id==='start'?cmd().start:cmd().nodes.find(n=>n.id===id);
 const newCmd=()=>{kind='cmd';B.commands.push(mkCmd());openCmd(B.commands.length-1)};
 const openCmd=i=>{cur=i;page='bd';sel='start';tab='Actions';q='';view={x:60,y:40,z:1};shell()};
-function builder(){$('#pg').innerHTML=`<div class="bd"><div class="pn"><b>Blocks</b><div class="tabs" id="tl"></div><div class="sb"><span><i data-lucide="search" class="li"></i></span><input id="bsr" placeholder="Search blocks (press / to focus)" oninput="q=this.value.toLowerCase().trim();drawPalette()"></div><div id="pl"></div></div>
-<div class="cw"><div class="tb"><button onclick="page=kind==='ev'?'evs':'cmds';shell()"><i data-lucide="arrow-left" class="li"></i></button><b id="tn">${esc(flowTitle(cmd()))}</b><small id="sv" class="mu">Saved</small><span style="flex:1"></span><span class="mu" id="zl"></span><button onclick="fit()"><i data-lucide="maximize" class="li"></i> Fit view</button><button class="x" onclick="delCmd(${cur})"><i data-lucide="trash" class="li"></i> Delete</button><button class="pr" onclick="saveCmds()"><i data-lucide="save" class="li"></i> Save ${kind==='ev'?'Event':'Command'}</button></div>
-<div class="cvs" id="cvs"><div id="world"><svg id="edges"></svg><div id="nodes"></div></div></div></div><div class="pp" id="pp"></div></div>`;drawPalette();drawNodes();drawProps();fit()}
+function builder(){$('#pg').innerHTML=`<div class="bd ${UI.rpOpen?'':'rp-off'}"><div class="pn"><b>Blocks</b><div class="tabs" id="tl"></div><div class="sb"><span><i data-lucide="search" class="li"></i></span><input id="bsr" placeholder="Search blocks (press / to focus)" oninput="q=this.value.toLowerCase().trim();drawPalette()"></div><div id="pl"></div></div>
+<div class="cw"><div class="tb"><button onclick="page=kind==='ev'?'evs':'cmds';shell()"><i data-lucide="arrow-left" class="li"></i></button><b id="tn">${esc(flowTitle(cmd()))}</b><small id="sv" class="mu">Saved</small><span style="flex:1"></span><span class="mu" id="zl"></span><button onclick="togRP()" title="Show / hide the properties panel"><i data-lucide="sliders-horizontal" class="li"></i></button><button onclick="fit()"><i data-lucide="maximize" class="li"></i> Fit view</button><button class="x" onclick="delCmd(${cur})"><i data-lucide="trash" class="li"></i> Delete</button><button class="pr" onclick="saveCmds()"><i data-lucide="save" class="li"></i> Save ${kind==='ev'?'Event':'Command'}</button></div>
+<div class="cvs" id="cvs"><div id="world"><svg id="edges"></svg><div id="nodes"></div></div></div></div><div class="pp" id="pp"></div><div class="rz" data-k="lp" onpointerdown="rzStart(event,'lp')"></div><div class="rz" data-k="rp" onpointerdown="rzStart(event,'rp')"><button class="rzb" onclick="togRP()" title="Show / hide the properties panel">${I(UI.rpOpen?'chevron-right':'chevron-left')}</button></div></div>`;applyUI();drawPalette();drawNodes();drawProps();fit()}
 function drawPalette(){const ev=kind==='ev',tabs=ev?['Actions','Conditions','Variables']:['Options','Actions','Conditions','Variables'];if(!tabs.includes(tab))tab='Actions';
  $('#tl').innerHTML=tabs.map(t=>`<div class="${t===tab?'on':''}" onclick="tab='${t}';drawPalette()">${t}</div>`).join('');
  const blk=([k,s])=>{const lk=s.needs&&!intentOn(s.needs);return `<div class="bi" ${lk?`style="opacity:.5" onclick="toast('Enable the ${INT[s.needs][0]} intent in Settings first')"`:`onmousedown="palDown(event,'${k}')" onclick="if(!palMoved)addNode('${k}')"`}><div class="ic" style="background:${s.t===C?'var(--gr)':'var(--bl)'}">${I(ico(s.n))}</div><div style="flex:1"><b>${nm(s.n)}</b><small>${lk?'<i data-lucide="lock" class="li"></i> Needs the '+INT[s.needs][0]+' intent':s.d}</small></div><span class="fav ${FAV.has(k)?'on':''}" title="Favorite" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();togFav('${k}')"><i data-lucide="star" class="li"></i></span></div>`};
