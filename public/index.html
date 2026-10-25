@@ -162,6 +162,45 @@ details.vd[open] .vls{animation:fadeUp .25s both}details.ovr[open]>.ovg,details.
 .emp{animation:floaty 3s ease-in-out infinite}
 .sw button:hover{transform:scale(1.2)}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
+
+/* ---- modern If/Else + property polish ---- */
+.chk-src{display:flex;flex-direction:column;gap:8px;margin:10px 0}
+.chk-src .src{display:flex;gap:12px;align-items:flex-start;padding:12px;border:1px solid var(--ln);border-radius:12px;cursor:pointer;background:var(--bg);transition:border-color .15s,background .15s}
+.chk-src .src:hover{border-color:var(--bl);background:var(--hv)}
+.chk-src .src.on{border-color:var(--gr);background:color-mix(in srgb,var(--gr) 8%,var(--bg));box-shadow:0 0 0 1px var(--gr)}
+.chk-src .src .rd{width:18px;height:18px;border-radius:50%;border:2px solid var(--ln2);flex:none;margin-top:2px;display:grid;place-items:center}
+.chk-src .src.on .rd{border-color:var(--gr);background:var(--gr)}
+.chk-src .src.on .rd:after{content:"";width:8px;height:8px;border-radius:50%;background:#fff}
+.chk-src .src b{display:block;font-size:13px}
+.chk-src .src small{display:block;color:var(--mu);font-size:12px;margin-top:2px;line-height:1.35}
+.chk-val{margin:8px 0 4px;position:relative}
+.chk-val input,.chk-val select{padding-right:42px}
+.chk-val .codebtn{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:var(--p2);border:1px solid var(--ln);border-radius:8px;padding:4px 8px;font:11px monospace;color:var(--yl);cursor:pointer}
+.chk-val .codebtn:hover{border-color:var(--bl)}
+.chk-ops{margin:14px 0 6px}
+.chk-ops .gh{margin-top:12px}
+.op-chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.op-chips button{padding:7px 12px;border-radius:999px;font-size:12px;background:var(--p2);border:1px solid var(--ln);color:var(--tx)}
+.op-chips button:hover{border-color:var(--bl)}
+.op-chips button.on{background:var(--gr);border-color:var(--gr);color:#06240f;font-weight:600}
+.chk-right{margin-top:10px}
+.chk-otherwise{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;background:var(--bg);border:1px solid var(--ln);border-radius:12px;margin:14px 0 6px;color:var(--mu);font-size:13px}
+.chk-otherwise b{color:var(--tx)}
+.miss{display:flex;align-items:center;gap:8px;padding:10px 12px;background:color-mix(in srgb,var(--yl) 12%,var(--bg));border:1px solid var(--yl);border-radius:10px;color:var(--yl);font-size:13px;margin:8px 0}
+.fld-wrap{position:relative;margin:8px 0}
+.fld-wrap label{display:block;color:var(--mu);font-size:12px;margin:0 0 3px}
+.fld-wrap .varbtn{position:absolute;right:6px;bottom:6px;background:var(--p2);border:1px solid var(--ln);border-radius:7px;padding:3px 7px;font:11px monospace;color:var(--yl);cursor:pointer;z-index:2}
+.fld-wrap .varbtn:hover{border-color:var(--bl)}
+.var-drop{position:absolute;right:0;top:100%;margin-top:4px;width:min(320px,92vw);max-height:240px;overflow:auto;background:var(--p1);border:1px solid var(--ln);border-radius:12px;box-shadow:0 12px 40px #0006;z-index:30;padding:6px;display:none}
+.var-drop.open{display:block}
+.var-drop .vr{padding:7px 10px;border-radius:8px;cursor:pointer;display:flex;justify-content:space-between;gap:8px}
+.var-drop .vr:hover{background:var(--p2)}
+.var-drop .vr code{color:var(--yl);font-size:12px}
+.var-drop .gh{margin:6px 4px 2px;font-size:10px}
+.pp h3{display:flex;align-items:center;gap:8px}
+.pp .mu.lead{margin:0 0 12px;line-height:1.4}
+.bi{transition:background .12s,border-color .12s}
+
 </style>
 <style id="layout">
 .body{grid-template-columns:var(--navw,240px) minmax(0,1fr);position:relative}
@@ -271,7 +310,7 @@ const SCHEMA={
  kick:{n:'log-out Kick',t:A,c:'MEMBERS',d:'Kicks a user',f:[TGT,RSN]},
  ban:{n:'gavel Ban',t:A,c:'MEMBERS',d:'Bans a user',f:[TGT,RSN]},
  unban:{n:'lock-open Unban',t:A,c:'MEMBERS',d:'Unbans a user by ID',f:[['user','text','User ID or variable'],RSN]},
- cond:{n:'shuffle If / Else',t:C,c:'CONDITIONS',d:'Check a value, such as a variable or an option. True → green dot, false → red dot',f:[['left','text','Left value (e.g. {opt.number})'],['op','select','Operator',['equals','not equals','contains','contains (ignore case)','not contains','starts with','ends with','greater','less','greater or equal','less or equal','is empty','is not empty']],['right','text','Right value'],OTH]},
+ cond:{n:'git-branch If / Else',t:C,c:'CONDITIONS',d:'Check a value (variable, option or text) and run different blocks. Green = true, red = otherwise.',f:[['left','text','Value to check'],['op','select','Operator',['equals','not equals','contains','contains (ignore case)','not contains','starts with','ends with','greater','less','greater or equal','less or equal','is empty','is not empty']],['right','text','Compare with'],OTH]},
  cond_admin:{n:'shield Is Administrator?',t:C,c:'CONDITIONS',d:'Checks the user permissions',f:[OTH]},
  cond_role:{n:'award Has Role?',t:C,c:'CONDITIONS',d:'Checks the roles of a user. Several roles allowed',f:[TGT,['role','text','Role IDs or variables (several allowed, separated by spaces)'],['mode','select','The member must have',['any of these roles','all of these roles','none of these roles']],OTH]},
  stop:{n:'octagon-x Stop Flow',t:A,c:'FLOW',d:'Ends everything right here',f:[]},
@@ -302,7 +341,7 @@ const SCHEMA={
  cond_channel:{n:'hash Channel Condition',t:C,c:'CONDITIONS',d:'Run actions based on the channel the command or event happened in',f:[['channel','text','Channel ID (empty = current)'],['mode','select','Check',['is channel','is in category','is type','name contains','is NSFW']],['value','text','Value: channel / category ID, a type (text, voice, thread, forum, announcement, stage, category) or part of a name'],OTH]},
  cond_user:{n:'user User Condition',t:C,c:'CONDITIONS',d:'Run actions based on who used the command or triggered the event',f:[TGT,['mode','select','Check',['is one of these users','is a bot','is not a bot','is server owner','is boosting','account older than (days)','joined more than (days) ago','is timed out']],['value','text','Value: user IDs, or a number of days'],OTH]},
  cond_reacted:{n:'face-grinning Reaction Condition',t:C,c:'CONDITIONS',d:'Run actions if a user reacted to a message',f:[CHN,MSGID,['emoji','text','Emoji (empty = any reaction)'],TGT,OTH]},
- cond_premium:{n:'badge-dollar-sign Premium Check Condition',t:C,c:'CONDITIONS',d:'Run actions based on whether the user has the bot premium subscription',f:[OTH]},
+ /* removed premium */ _cond_premium:{n:'badge-dollar-sign Premium Check Condition',t:C,c:'CONDITIONS',d:'',f:[OTH]},
  cond_cooldown:{n:'hourglass Cooldown Condition',t:C,c:'CONDITIONS',d:'Passes only when the cooldown is over, then starts it again. True → green dot, false → red dot',f:[['name','text','Cooldown name (empty = only this block; same name = shared by blocks)'],['seconds','number','Seconds'],['scope','select','Applies to',['each user','each server','everyone']],['otherwise','text','Message while on cooldown — use {cooldown} for the time left']]},
  cond_voice:{n:'mic Voice Condition',t:C,c:'CONDITIONS',d:'Run actions based on the voice state of a member',f:[TGT,['mode','select','Check',['is in a voice channel','is in this voice channel (ID)','is server muted','is server deafened','is streaming']],['channel','text','Voice channel ID (for "is in this voice channel")'],OTH]},
  data:{n:'save Saved Data',t:A,c:'UTILITY',d:'Saves and reads values in a database: counters, points, flags, text, lists. Survives restarts (see the Databases page)',f:[['op','select','Operation',['get','set','add','subtract','toggle','push','push unique','remove item','delete','exists','keys']],['db','dbpick','Database'],['key','text','Key (e.g. points) — not needed for "keys"'],['type','select','Type (used by set; auto = detect)',['auto','string','number','boolean','list','json']],['value','textarea','Value (set / add / subtract / push / remove item). Lists: one item per line'],['scope','select','Stored for',['whole bot','each server','each user','each user per server']],['saveAs','text','Save the result as variable — use {var.name} (default: data)']]}
@@ -382,7 +421,7 @@ document.addEventListener('keydown',e=>{
  else if(e.key==='Escape'){if(e.target.matches?.('.sb input')&&e.target.value){e.target.value='';e.target.dispatchEvent(new Event('input'))}else if($('#evp'))$('#evp').remove();else if(e.target.matches?.('.sb input'))e.target.blur()}});
 
 const DEF={on_react:()=>({emoji:'👍',addReaction:true,who:'anyone'}),dm:()=>({msg:{...defMsg(),sendMode:'new'}}),message:()=>({msg:defMsg()}),send_channel:()=>({msg:{...defMsg(),sendMode:'new'}}),modal:()=>({modal:defModal()}),wait:()=>({seconds:2}),cond:()=>({op:'equals'}),api:()=>({method:'GET',saveAs:'api'}),channel_create:()=>({kind:'text',name:'new-channel'}),role_create:()=>({name:'New Role'}),loop:()=>({mode:'times',times:3}),cond_chance:()=>({percent:50})};
-const summ=n=>{const nd=SCHEMA[n.type]?.needs;if(nd&&!intentOn(nd))return 'Enable the '+INT[nd][0]+' intent in Settings';if(n.type==='on_click'){const p=pressables().find(x=>x[0]===n.data.target);return p?p[1]:'Choose a button / option'};if(n.type==='modal')return `Modal · ${(n.data.modal?.items||[]).length||'?'} component(s)`;if(n.type==='on_react'){const mb=msgBlocks().find(x=>x[0]===n.data.target);return (n.data.emoji||'any emoji')+' → '+(mb?mb[1]:'choose a message')};if(n.type==='message'||((n.type==='send_channel'||n.type==='dm')&&n.data.msg))return n.data.msg?.mode==='v2'?'Components V2 message':`Message · ${(n.data.msg?.embeds||[]).length} embed(s)`;const v=Object.values(n.data||{}).find(x=>typeof x==='string'&&x);return v?String(v).slice(0,42):(SCHEMA[n.type]?.d||'')};
+const summ=n=>{const nd=SCHEMA[n.type]?.needs;if(nd&&!intentOn(nd))return 'Enable the '+INT[nd][0]+' intent in Settings';if(n.type==='cond'){const op=OP_LABEL[n.data.op]||n.data.op||'equals';const L=(n.data.left||'…');const R=['is empty','is not empty'].includes(n.data.op)?'':(' '+(n.data.right||'…'));return `${L} ${op}${R}`};if(n.type==='on_click'){const p=pressables().find(x=>x[0]===n.data.target);return p?p[1]:'Choose a button / option'};if(n.type==='modal')return `Modal · ${(n.data.modal?.items||[]).length||'?'} component(s)`;if(n.type==='on_react'){const mb=msgBlocks().find(x=>x[0]===n.data.target);return (n.data.emoji||'any emoji')+' → '+(mb?mb[1]:'choose a message')};if(n.type==='message'||((n.type==='send_channel'||n.type==='dm')&&n.data.msg))return n.data.msg?.mode==='v2'?'Components V2 message':`Message · ${(n.data.msg?.embeds||[]).length} embed(s)`;const v=Object.values(n.data||{}).find(x=>typeof x==='string'&&x);return v?String(v).slice(0,42):(SCHEMA[n.type]?.d||'')};
 const pressables=()=>{const x=cmd(),out=[];let k=0;
  const walk=(it,m)=>{if(!it||typeof it!=='object')return;
   if(it.t==='buttons')(it.buttons||[]).forEach(bt=>{if(bt.style!=='link')out.push([bt.id,`${bt.label||'Button'} — ${m}`])});
@@ -400,10 +439,10 @@ if(t==='dbpick')return `<label>${l}</label><select oninput="setN('${k}',this.val
  const h=`oninput="setN('${k}',this.type==='checkbox'?this.checked:this.value)"`;
  if(t==='note')return `<p class="mu">${l}</p>`;
  if(t==='bool')return `<label class="ck"><input type="checkbox" ${v?'checked':''} ${h}>${l}</label>`;
- if(t==='textarea')return `<label>${l}</label><textarea ${h}>${esc(v)}</textarea>`;
+ if(t==='textarea')return `<div class="fld-wrap"><label>${l}</label><textarea ${h}>${esc(v)}</textarea><button type="button" class="varbtn" onclick="openVarDrop(this)">{ }</button></div>`;
  if(t==='select')return `<label>${l}</label><select ${h}>${o.map(x=>`<option ${x===(v||o[0])?'selected':''}>${x}</option>`).join('')}</select>`;
  if(t==='color')return `<label>${l}</label><input type="color" value="${esc(v||'#5865f2')}" ${h}>`;
- return `<label>${l}</label><input type="${t==='number'?'number':'text'}" value="${esc(v)}" ${h}>`}
+ return `<div class="fld-wrap"><label>${l}</label><input type="${t==='number'?'number':'text'}" value="${esc(v)}" ${h}>${t==='number'?'':`<button type="button" class="varbtn" onclick="openVarDrop(this)">{ }</button>`}</div>`}
 
 // ---------- routing (each section has its own URL) ----------
 const ROUTES={home:'/dashboard',cmds:'/command-builder',evs:'/events',vars:'/variables',dbs:'/databases',set:'/settings',acc:'/account'},TITLES={home:'Dashboard',cmds:'Command Builder',evs:'Events',vars:'Variables',dbs:'Databases',set:'Settings',acc:'Account',bd:'Editor'};
@@ -416,7 +455,31 @@ const sync=rep=>{const u=urlFor();document.title='OpenBot · '+(TITLES[page]||''
 function applyRoute(p){p=clean(p);page='home';cur=null;const m=p.match(/^\/(command-builder|commands|events)\/([^/]+)$/);
  if(m){kind=m[1]==='events'?'ev':'cmd';const i=L().findIndex(x=>x.id===decodeURIComponent(m[2]));if(i>=0){cur=i;page='bd';sel='start';tab='Actions';q='';view={x:60,y:40,z:1}}else page=kind==='ev'?'evs':'cmds';return}
  const k=PATHS[p];if(k){page=k;if(k==='cmds')kind='cmd';if(k==='evs')kind='ev'}}
-addEventListener('popstate',()=>{if(!me){mode=location.pathname==='/register'?'reg':'login';return authView()}if(!B)return boot();applyRoute(entryPath());sync(1);shell()});
+addEventListener('popstate',()=>{if(!me){mode=location.pathname==='/register'?'reg':'login';return authView()}if(!B)return 
+// DEMO_MODE: open canvas without server when ?demo=1
+if(location.search.includes('demo=1')||location.hash==='#demo'){
+  const _fetch=window.fetch;
+  window.fetch=async (u,o)=>{
+    const url=String(u);
+    if(url.includes('/api/login')||url.includes('/api/register')) return new Response(JSON.stringify({ok:1}),{headers:{'content-type':'application/json'}});
+    if(url.includes('/api/logout')) return new Response(JSON.stringify({ok:1}),{headers:{'content-type':'application/json'}});
+    if(url.includes('/api/me')) return new Response(JSON.stringify({user:'demo',profile:{displayName:'Demo',theme:'dark'},bots:[{id:'demo1',botId:'1',name:'Demo Bot',avatar:'https://cdn.discordapp.com/embed/avatars/0.png',running:false}]}),{headers:{'content-type':'application/json'}});
+    if(url.match(/\/api\/bots\/[^/]+$/)&&(!o||o.method==='GET'||!o.method)) return new Response(JSON.stringify({
+      id:'demo1',botId:'1',name:'Demo Bot',avatar:'https://cdn.discordapp.com/embed/avatars/0.png',running:false,revC:0,revE:0,
+      settings:{status:'online',activityType:4,activityText:'Demo',guildId:'',autoStart:false,intents:{}},
+      commands:[{id:'c1',name:'test',description:'Demo command',enabled:true,options:[{name:'number',type:'integer',description:'A number',required:true}],
+        start:{x:80,y:60,next:'n1'},nodes:[{id:'n1',type:'cond',name:'',x:80,y:220,data:{left:'{opt.number}',op:'equals',right:'10',_src:'opt'},next:null,else:null}]}],
+      events:[],modules:{},databases:['default']
+    }),{headers:{'content-type':'application/json'}});
+    if(url.includes('/api/bots/')&&o&&(o.method==='POST'||o.method==='DELETE')) return new Response(JSON.stringify({ok:1,id:'demo1',botId:'1',name:'Demo Bot',avatar:'https://cdn.discordapp.com/embed/avatars/0.png',running:false,revC:0,revE:0,settings:{},commands:[],events:[],modules:{},databases:['default']}),{headers:{'content-type':'application/json'}});
+    if(url.includes('/api/')) return new Response(JSON.stringify({ok:1}),{headers:{'content-type':'application/json'}});
+    return _fetch(u,o);
+  };
+  // auto mark logged in session cookie-ish
+  document.cookie='sid=demo000000000000000000000000000000000000000000; path=/';
+}
+
+boot();applyRoute(entryPath());sync(1);shell()});
 
 // ---------- auth + bot gate ----------
 function authView(){const u=(mode==='login'?'/login':'/register')+(nextP?'?next='+encodeURIComponent(nextP):'');if(location.pathname+location.search!==u)history[['/login','/register'].includes(location.pathname)?'pushState':'replaceState'](null,'',u);document.title='OpenBot · '+(mode==='login'?'Sign in':'Register');$('#root').innerHTML=`<div class="ov" style="position:static;height:100vh"><div class="mo"><h2 style="color:var(--yl)" class="logo"><img src="/assets/logo.png" alt="" onerror="this.style.display='none'">OpenBot</h2><p class="mu">${mode==='login'?'Sign in to your account':'Create your account'}</p><label>Username</label><input id="au"><label>Password</label><input id="ap" type="password" onkeydown="event.key==='Enter'&&doAuth()"><p style="display:flex;gap:8px"><button class="pr" onclick="doAuth()">${mode==='login'?'Sign in':'Create account'}</button><button onclick="mode=mode==='login'?'reg':'login';authView()">${mode==='login'?'Create account':'I have an account'}</button></p></div></div>`}
@@ -550,7 +613,7 @@ function drawPalette(){const ev=kind==='ev',tabs=ev?['Actions','Conditions','Var
  else if(tab==='Variables')l=vlist()+'<p class="mu">Focus a text field, then click a variable.</p>';
  else{
   // while searching, look through every block (actions and conditions); otherwise show the selected tab
-  const ents=Object.entries(SCHEMA).filter(([k,s])=>!(ev&&s.cmd)&&(q?`${s.n} ${s.d} ${s.c}`.toLowerCase().includes(q):s.t===tab));
+  const ents=Object.entries(SCHEMA).filter(([k,s])=>!k.startsWith('_')&&!(ev&&s.cmd)&&(q?`${s.n} ${s.d} ${s.c}`.toLowerCase().includes(q):s.t===tab));
   const favs=q?[]:ents.filter(([k])=>FAV.has(k));
   if(favs.length)l+=`<div class="gh"><i data-lucide="star" class="li"></i> FAVORITES</div>`+favs.map(blk).join('');
   const gr={};ents.forEach(e=>(gr[e[1].c]=gr[e[1].c]||[]).push(e));
@@ -583,6 +646,129 @@ const setName=v=>{const n=nodeById(sel);if(!n||sel==='start')return;n.name=v.tri
 const setN=(k,v)=>{const n=nodeById(sel);n.data[k]=v;const g=$(`#n-${sel} .gb`);if(g)g.textContent=summ(n)};
 const addOpt=t=>{(cmd().options=cmd().options||[]).push({name:'',description:'',type:t});select('start');dirty()};
 const upd=()=>{$('#n-start b').textContent=flowTitle(cmd());$('#tn').textContent=flowTitle(cmd());$('#n-start .gb').textContent=flowDesc(cmd())};
+
+// ---------- modern If / Else panel ----------
+const OP_GROUPS = [
+  ['SAME OR DIFFERENT', [['equals','Is equal to'],['not equals','Is not equal to']]],
+  ['NUMBERS', [['greater','Greater than'],['greater or equal','Greater or equal'],['less','Less than'],['less or equal','Less or equal']]],
+  ['TIME', [['less','Is before'],['greater','Is after']]],
+  ['TEXT', [['contains','Contains'],['not contains','Does not contain'],['starts with','Starts with'],['ends with','Ends with'],['contains (ignore case)','Contains (ignore case)'],['is empty','Is empty'],['is not empty','Is not empty']]],
+  ['COLLECTIONS', [['contains','Collection contains'],['not contains','Collection does not contain']]],
+];
+const OP_LABEL = Object.fromEntries(OP_GROUPS.flatMap(([,ops])=>ops));
+function detectSrc(left){
+  const s=String(left||'');
+  if(/^\{var\.[\w.-]+\}$/.test(s)) return 'var';
+  if(/^\{opt\.[\w.-]+\}$/.test(s)) return 'opt';
+  return 'else';
+}
+function condVarOptions(){
+  const out=[];
+  for(const [title,list] of dynVars()) for(const [v,d] of list) out.push({v,d,g:title});
+  if(typeof VG!=='undefined') for(const [title,list] of VG) for(const [v,d] of list) if(!out.some(x=>x.v===v)) out.push({v,d,g:title});
+  return out;
+}
+function condOptOptions(){
+  const x=typeof cur==='number'&&L()?.[cur];
+  if(!x) return [];
+  return (x.options||[]).filter(o=>okn(o.name)).flatMap(o=>{
+    const n=o.name.toLowerCase();
+    const r=[{v:`{opt.${n}}`,d:`Option "${n}" (${o.type})`}];
+    if(['user','role','channel'].includes(o.type)){
+      r.push({v:`{opt.${n}.id}`,d:`ID of "${n}"`},{v:`{opt.${n}.name}`,d:`Name of "${n}"`});
+    }
+    return r;
+  });
+}
+function setCondSrc(kind){
+  const n=nodeById(sel); if(!n||n.type!=='cond') return;
+  n.data._src=kind;
+  if(kind==='var'){ n.data.left=condVarOptions()[0]?.v||''; }
+  else if(kind==='opt'){ n.data.left=condOptOptions()[0]?.v||''; }
+  else { if(detectSrc(n.data.left)!=='else') n.data.left=''; }
+  dirty(); drawProps();
+}
+function setCondLeft(v){ const n=nodeById(sel); if(!n) return; n.data.left=v; dirty(); drawProps(); }
+function setCondOp(op){
+  const n=nodeById(sel); if(!n) return;
+  n.data.op=op;
+  if(op==='is empty'||op==='is not empty') n.data.right='';
+  dirty(); drawProps();
+}
+function condProps(n){
+  const d=n.data||{};
+  const src=d._src||detectSrc(d.left);
+  const op=d.op||'equals';
+  const needsRight=!['is empty','is not empty'].includes(op);
+  const varOpts=condVarOptions(), optOpts=condOptOptions();
+  const missing=!d.left||!op;
+  let leftUI='';
+  if(src==='var'){
+    leftUI=`<div class="chk-val"><label>Variable</label><select onchange="setCondLeft(this.value)"><option value="">— pick a variable —</option>${varOpts.map(o=>`<option value="${esc(o.v)}" ${o.v===d.left?'selected':''}>${esc(o.v)} — ${esc(o.d)}</option>`).join('')}</select></div>`;
+    if(!varOpts.length) leftUI+=`<p class="mu">No variables yet. Use <b>Set Variable</b> or Data Storage first.</p>`;
+  } else if(src==='opt'){
+    leftUI=`<div class="chk-val"><label>Command option</label><select onchange="setCondLeft(this.value)"><option value="">— pick an option —</option>${optOpts.map(o=>`<option value="${esc(o.v)}" ${o.v===d.left?'selected':''}>${esc(o.v)} — ${esc(o.d)}</option>`).join('')}</select></div>`;
+    if(!optOpts.length) leftUI+=`<p class="mu">This command has no options. Add some in the Start block.</p>`;
+  } else {
+    leftUI=`<div class="chk-val"><label>Value to check</label><input value="${esc(d.left||'')}" placeholder="e.g. 10 or {user.name}" oninput="setN('left',this.value)"><button type="button" class="codebtn" title="Insert variable" onclick="openVarDrop(this)"> { } </button></div>
+    <p class="mu" style="font-size:12px;margin:4px 0 0">Press the code button to pick from every variable. This field used to be called the Base Value.</p>`;
+  }
+  const chips=OP_GROUPS.map(([title,ops])=>`<div class="gh">${title}</div><div class="op-chips">${ops.map(([k,label])=>`<button type="button" class="${op===k?'on':''}" onclick="setCondOp('${k}')">${esc(label)}</button>`).join('')}</div>`).join('');
+  return `
+<p class="mu lead">Check a value, such as a variable or an option, and run different blocks depending on what it is.</p>
+${missing?`<div class="miss"><i data-lucide="triangle-alert" class="li"></i> <span><b>1 thing missing</b> — pick what to check and an operator</span></div>`:''}
+<div class="gh">WHAT DO YOU WANT TO CHECK?</div>
+<p class="mu" style="margin:0 0 6px;font-size:12px">Every check below looks at this one value.</p>
+<div class="chk-src">
+  <div class="src ${src==='var'?'on':''}" onclick="setCondSrc('var')"><div class="rd"></div><div><b>One of my variables</b><small>Coins, XP, a setting: anything you made in Data Storage or Set Variable.</small></div></div>
+  <div class="src ${src==='opt'?'on':''}" onclick="setCondSrc('opt')"><div class="rd"></div><div><b>An option of this command</b><small>What the member typed or picked when they ran it.</small></div></div>
+  <div class="src ${src==='else'?'on':''}" onclick="setCondSrc('else')"><div class="rd"></div><div><b>Something else</b><small>Any other value — member name, API result, plain text or a custom expression.</small></div></div>
+</div>
+${leftUI}
+<div class="gh" style="margin-top:16px">YOUR CHECKS</div>
+<p class="mu" style="margin:0 0 6px;font-size:12px">Each check is a branch on the canvas. Connect blocks under a branch and they run when that check is true.</p>
+<div class="chk-ops">${chips}</div>
+${needsRight?`<div class="chk-right"><label>Compare with</label><div class="fld-wrap" style="margin:0"><input value="${esc(d.right||'')}" placeholder="Value, variable or number" oninput="setN('right',this.value)"><button type="button" class="varbtn" onclick="openVarDrop(this)"> { } </button></div></div>`:'<p class="mu">This operator does not need a second value.</p>'}
+<div class="chk-otherwise"><span><b>Otherwise</b>, when none of the checks are true</span><span style="color:var(--mu)">→ red port</span></div>
+<p class="mu" style="font-size:12px">Connect the <b style="color:var(--gr)">green</b> port for when the check passes, and the <b style="color:#f87171">red</b> port for the otherwise path.</p>`;
+}
+function openVarDrop(btn){
+  document.querySelectorAll('.var-drop.open').forEach(d=>d.classList.remove('open'));
+  let drop=btn.parentElement.querySelector('.var-drop');
+  if(!drop){
+    drop=document.createElement('div'); drop.className='var-drop';
+    let html='';
+    const add=(title,list)=>{ if(!list?.length) return; html+=`<div class="gh">${esc(title).toUpperCase()}</div>`; for(const [v,d] of list) html+=`<div class="vr" onmousedown="event.preventDefault()" onclick="pickVar(this,'${String(v).replace(/'/g,"\\'")}')"><code>${esc(v)}</code><span class="mu">${esc(d)}</span></div>`; };
+    for(const [t,l] of dynVars()) add(t,l);
+    if(typeof VG!=='undefined') for(const [t,l] of VG) add(t,l);
+    drop.innerHTML=html||'<p class="mu" style="padding:8px">No variables available</p>';
+    btn.parentElement.style.position='relative';
+    btn.parentElement.appendChild(drop);
+  }
+  drop.classList.add('open');
+  const close=e=>{ if(!drop.contains(e.target)&&e.target!==btn){ drop.classList.remove('open'); document.removeEventListener('mousedown',close); } };
+  setTimeout(()=>document.addEventListener('mousedown',close),0);
+}
+function pickVar(el,v){
+  const wrap=el.closest('.fld-wrap, .chk-val');
+  const input=wrap?.querySelector('input, select, textarea');
+  if(input){
+    if(input.tagName==='SELECT'){
+      if(![...input.options].some(o=>o.value===v)){ const o=document.createElement('option'); o.value=v; o.textContent=v; input.appendChild(o); }
+      input.value=v;
+    } else {
+      const start=input.selectionStart??input.value.length, end=input.selectionEnd??start;
+      input.value=input.value.slice(0,start)+v+input.value.slice(end);
+      input.focus();
+      try{ input.setSelectionRange(start+v.length,start+v.length); }catch{}
+    }
+    input.dispatchEvent(new Event('input',{bubbles:true}));
+  }
+  el.closest('.var-drop')?.classList.remove('open');
+  dirty();
+}
+
+
 function drawProps(){const p=$('#pp');if(!p)return;
  if(sel==='start'&&kind==='ev'){p.innerHTML=evProps(cmd());return}
  if(sel==='start'){const x=cmd();p.innerHTML=`<h3><i data-lucide="zap" class="li"></i> Command</h3><label>Name (lowercase, no spaces)</label><input value="${esc(x.name)}" oninput="cmd().name=this.value;upd()"><label>Description</label><input value="${esc(x.description)}" oninput="cmd().description=this.value;upd()">
@@ -590,7 +776,15 @@ function drawProps(){const p=$('#pp');if(!p)return;
  <div class="gh">OPTIONS</div>${(x.options||[]).map((o,j)=>`<div class="bx"><div class="ih"><b>${o.type}</b><button class="x" onclick="cmd().options.splice(${j},1);drawProps();dirty()"><i data-lucide="x" class="li"></i></button></div><label>Name</label><input value="${esc(o.name)}" oninput="cmd().options[${j}].name=this.value"><label>Description</label><input value="${esc(o.description)}" oninput="cmd().options[${j}].description=this.value"><label class="ck"><input type="checkbox" ${o.required?'checked':''} onchange="cmd().options[${j}].required=this.checked">Required</label></div>`).join('')}<button onclick="addOpt('string')"><i data-lucide="plus" class="li"></i> Add option</button>
  <p class="mu">Drag a block's bottom dot onto another block to connect. Drag the background to move the camera, scroll to zoom, Delete removes the selected block.</p>`;return}
  const n=nodeById(sel);if(!n){p.innerHTML='';return}const s=SCHEMA[n.type]||{n:'triangle-alert Unknown block',f:[],d:''};
- p.innerHTML=`<h3>${I(ico(s.n))} ${esc(nm(s.n))}</h3><p class="mu">${s.d||''}</p>${s.needs&&!intentOn(s.needs)?`<p style="color:#f87171"><i data-lucide="lock" class="li"></i> This block needs the ${INT[s.needs][0]} intent. Enable it in Settings.</p>`:''}<label>Block name (optional)</label><input maxlength="40" placeholder="${esc(s.n.slice(s.n.indexOf(' ')+1))}" value="${esc(n.name||'')}" oninput="setName(this.value)">${n.type==='message'||n.type==='send_channel'||n.type==='dm'?`${n.type==='send_channel'?fld(CHN,n.data.channel):n.type==='dm'?fld(TGT,n.data.target):''}<button class="bl" style="width:100%;justify-content:center" onclick="editMsg('${n.id}')"><i data-lucide="pencil" class="li"></i> Edit message</button>${fld(['saveAs','text','Save the sent message ID as variable (use {var.name}) — lets other blocks edit, delete or react to it'],n.data.saveAs)}`:n.type==='modal'?`<button class="bl" style="width:100%;justify-content:center" onclick="editModal('${n.id}')"><i data-lucide="pencil" class="li"></i> Edit modal</button><p class="mu">Blocks connected below this one run when the user submits. Read answers with {field.id}.</p>`:s.f.map(f=>fld(f,n.data[f[0]])).join('')}<p style="display:flex;gap:8px;margin-top:16px"><button onclick="dupNode('${n.id}')"><i data-lucide="copy" class="li"></i> Duplicate</button><button class="x" onclick="delNode('${n.id}')"><i data-lucide="trash" class="li"></i> Delete</button></p>`}
+ const head=`<h3>${I(ico(s.n))} ${esc(nm(s.n))}</h3>`+
+  (s.needs&&!intentOn(s.needs)?`<p style="color:#f87171"><i data-lucide="lock" class="li"></i> This block needs the ${INT[s.needs][0]} intent. Enable it in Settings.</p>`:'')+
+  `<label>Block name (optional)</label><input maxlength="40" placeholder="${esc(s.n.slice(s.n.indexOf(' ')+1))}" value="${esc(n.name||'')}" oninput="setName(this.value)">`;
+ const foot=`<p style="display:flex;gap:8px;margin-top:16px"><button onclick="dupNode('${n.id}')"><i data-lucide="copy" class="li"></i> Duplicate</button><button class="x" onclick="delNode('${n.id}')"><i data-lucide="trash" class="li"></i> Delete</button></p>`;
+ if(n.type==='cond'){p.innerHTML=head+condProps(n)+foot;try{lucide.createIcons()}catch(e){}return}
+ p.innerHTML=head+`<p class="mu lead">${s.d||''}</p>`+
+  (n.type==='message'||n.type==='send_channel'||n.type==='dm'?`${n.type==='send_channel'?fld(CHN,n.data.channel):n.type==='dm'?fld(TGT,n.data.target):''}<button class="bl" style="width:100%;justify-content:center" onclick="editMsg('${n.id}')"><i data-lucide="pencil" class="li"></i> Edit message</button>${fld(['saveAs','text','Save the sent message ID as variable (use {var.name}) — lets other blocks edit, delete or react to it'],n.data.saveAs)}`:
+   n.type==='modal'?`<button class="bl" style="width:100%;justify-content:center" onclick="editModal('${n.id}')"><i data-lucide="pencil" class="li"></i> Edit modal</button><p class="mu">Blocks connected below this one run when the user submits. Read answers with {field.id}.</p>`:
+   s.f.map(f=>fld(f,n.data[f[0]])).join(''))+foot}
 const dbSel=x=>`<div class="gh">DATABASE</div><label>Default database for the Saved Data blocks</label><select onchange="cmd().database=this.value;dirty()"><option value="">default</option>${(B.databases||[]).filter(n=>n!=='default').map(n=>`<option ${x.database===n?'selected':''}>${esc(n)}</option>`).join('')}</select><p class="mu">A Saved Data block can still pick another database. Manage them in <i data-lucide="database" class="li"></i> Databases.</p>`;
 const cmdAccess=x=>`<div class="gh">STATUS</div><label class="ck"><input type="checkbox" ${x.enabled!==false?'checked':''} onchange="cmd().enabled=this.checked;dirty()">Command enabled</label><p class="mu">When off, using the command (or its buttons / menus / forms) replies <b>Command disabled</b> and only that person sees it. Save to apply.</p><div class="gh">WHO CAN USE IT</div><p class="mu">Anyone who doesn't match is blocked (only they see the warning). Leave empty = everyone. A member passes if they have the permissions <b>or</b> one of the allowed roles.</p>
  <label>Required permissions</label>${permGrid(x.reqPerms,'togPerm')}
